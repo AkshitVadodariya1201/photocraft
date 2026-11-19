@@ -379,30 +379,115 @@ impl PartMap {
         (coverage > 0.0).then_some((i, coverage))
     }
 
-    /// Coverage masks for every part over a `w × h` area at (`x0`, `y0`), row-major, one
-    /// `Vec<f32>` per part. Rows are computed in parallel on native targets.
-    pub fn masks(&self, x0: i64, y0: i64, w: usize, h: usize) -> Vec<Vec<f32>> {
-        let n = self.parts.len();
-        let row =
-            |y: usize| -> Vec<(usize, f32)> { (0..w).map(|x| self.at((x0 + x as i64) as f32, (y0 + y as i64) as f32).unwrap_or((usize::MAX, 0.0))).collect() };
+    /// Which part owns each pixel of a `w × h` area at (`x0`, `y0`), and how much (one owner
+    /// map and one 8-bit coverage map, not a float mask per part: a 17 MP photo with 18 prompts
+    /// needs ~50 MB this way instead of ~1.2 GB). Rows run in parallel on native targets.
+    pub fn assign(&self, x0: i64, y0: i64, w: usize, h: usize) -> Assignment {
+        let row = |y: usize| -> Vec<(u16, u8)> {
+            (0..w)
+                .map(|x| match self.at((x0 + x as i64) as f32, (y0 + y as i64) as f32) {
+                    Some((i, c)) => (u16::try_from(i).unwrap_or(NO_PART), (c * 255.0).round().clamp(0.0, 255.0) as u8),
+                    None => (NO_PART, 0),
+                })
+                .collect()
+        };
         #[cfg(not(target_arch = "wasm32"))]
-        let rows: Vec<Vec<(usize, f32)>> = {
+        let rows: Vec<Vec<(u16, u8)>> = {
             use rayon::prelude::*;
             (0..h).into_par_iter().map(row).collect()
         };
         #[cfg(target_arch = "wasm32")]
-        let rows: Vec<Vec<(usize, f32)>> = (0..h).map(row).collect();
-        let mut out = vec![vec![0.0f32; w * h]; n];
-        for (y, r) in rows.into_iter().enumerate() {
-            for (x, (i, c)) in r.into_iter().enumerate() {
-                if let Some(m) = out.get_mut(i)
-                    && let Some(v) = m.get_mut(y * w + x)
-                {
-                    *v = c;
-                }
+        let rows: Vec<Vec<(u16, u8)>> = (0..h).map(row).collect();
+        let mut owner = Vec::with_capacity(w * h);
+        let mut coverage = Vec::with_capacity(w * h);
+        for r in rows {
+            for (o, c) in r {
+                owner.push(o);
+                coverage.push(c);
             }
         }
-        out
+        Assignment { width: w, height: h, owner, coverage }
+    }
+}
+
+/// Owner value for a pixel no part covers.
+pub const NO_PART: u16 = u16::MAX;
+
+/// The result of [`PartMap::assign`]: per pixel, the owning part (or [`NO_PART`]) and its
+/// coverage `0..=255` (soft at edges).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Assignment {
+    pub width: usize,
+    pub height: usize,
+    pub owner: Vec<u16>,
+    pub coverage: Vec<u8>,
+}
+
+impl Assignment {
+    /// Coverage of part `part` (or of several parts that make one layer) as an 8-bit mask.
+    pub fn mask_of(&self, parts: &[usize]) -> Vec<u8> {
+        self.owner.iter().zip(&self.coverage).map(|(o, c)| if parts.iter().any(|p| *p == usize::from(*o)) { *c } else { 0 }).collect()
+    }
+
+    /// Give small holes to the part around them: a connected area of pixels less than half
+    /// covered, not touching the image border and at most `max_px` pixels, goes fully to the part
+    /// that owns most of its rim. Background showing through the figure (between an arm and the
+    /// body) is usually larger than `max_px` and stays empty. Returns the pixels filled.
+    pub fn fill_enclosed_gaps(&mut self, max_px: usize) -> usize {
+        let (w, h) = (self.width, self.height);
+        let n = w.saturating_mul(h);
+        if max_px == 0 || n == 0 || self.owner.len() != n || self.coverage.len() != n {
+            return 0;
+        }
+        let gap = |c: u8| c < 128;
+        let mut seen = vec![false; n];
+        let mut filled = 0usize;
+        let mut stack: Vec<usize> = Vec::new();
+        let mut comp: Vec<usize> = Vec::new();
+        for start in 0..n {
+            if seen[start] || !gap(self.coverage[start]) {
+                continue;
+            }
+            // Flood the gap area (4-connected), with an explicit stack: no recursion.
+            comp.clear();
+            stack.clear();
+            stack.push(start);
+            seen[start] = true;
+            let mut touches_border = false;
+            let mut rim = [0u32; 64 + 1];
+            while let Some(i) = stack.pop() {
+                comp.push(i);
+                let (x, y) = (i % w, i / w);
+                if x == 0 || y == 0 || x + 1 == w || y + 1 == h {
+                    touches_border = true;
+                }
+                let neighbours = [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
+                for j in neighbours.into_iter().flatten() {
+                    if gap(self.coverage[j]) {
+                        if !seen[j] {
+                            seen[j] = true;
+                            stack.push(j);
+                        }
+                    } else if let Some(slot) = rim.get_mut(usize::from(self.owner[j])) {
+                        *slot += 1;
+                    }
+                }
+            }
+            if touches_border || comp.len() > max_px {
+                continue;
+            }
+            let Some((best, count)) = rim.iter().enumerate().take(64).max_by_key(|(_, c)| **c) else { continue };
+            if *count == 0 {
+                continue;
+            }
+            let Ok(best) = u16::try_from(best) else { continue };
+            for &i in &comp {
+                self.owner[i] = best;
+                self.coverage[i] = 255;
+            }
+            filled += comp.len();
+        }
+        filled
     }
 }
 
@@ -445,10 +530,11 @@ mod tests {
         let map = PartMap::new(vec![a, b]).unwrap();
         assert_eq!(map.at(1.0, 0.0).map(|p| p.0), Some(0));
         assert_eq!(map.at(8.0, 0.0).map(|p| p.0), Some(1));
-        let masks = map.masks(0, 0, 10, 1);
-        assert_eq!(masks.len(), 2);
-        assert!(masks[0][1] > 0.99 && masks[1][1] == 0.0);
-        assert!(masks[1][8] > 0.99 && masks[0][8] == 0.0);
+        let a = map.assign(0, 0, 10, 1);
+        assert_eq!((a.owner[1], a.owner[8]), (0, 1));
+        assert!(a.coverage[1] > 250 && a.coverage[8] > 250);
+        assert_eq!(a.mask_of(&[0])[8], 0);
+        assert_eq!(a.mask_of(&[0, 1])[8], a.coverage[8]);
     }
 
     #[test]
@@ -494,7 +580,49 @@ mod tests {
     fn pixels_outside_every_part_are_unassigned() {
         let map = PartMap::new(vec![logits(4, 4, |_, _| -10.0)]).unwrap();
         assert_eq!(map.at(2.0, 2.0), None);
-        assert!(map.masks(0, 0, 4, 4)[0].iter().all(|v| *v == 0.0));
+        assert!(map.assign(0, 0, 4, 4).owner.iter().all(|o| *o == NO_PART));
+    }
+
+    fn grid(rows: &[&str]) -> Assignment {
+        // '.' = gap, digits = owning part (full coverage).
+        let (w, h) = (rows[0].len(), rows.len());
+        let mut owner = Vec::new();
+        let mut coverage = Vec::new();
+        for r in rows {
+            for ch in r.chars() {
+                match ch.to_digit(10) {
+                    Some(d) => {
+                        owner.push(d as u16);
+                        coverage.push(255);
+                    }
+                    None => {
+                        owner.push(NO_PART);
+                        coverage.push(0);
+                    }
+                }
+            }
+        }
+        Assignment { width: w, height: h, owner, coverage }
+    }
+
+    #[test]
+    fn small_enclosed_gaps_go_to_the_part_around_them() {
+        let mut a = grid(&["........", ".000111.", ".0..111.", ".000111.", "........"]);
+        // The 2-px hole is enclosed (mostly by part 0); the outside touches the border.
+        assert_eq!(a.fill_enclosed_gaps(10), 2);
+        assert_eq!((a.owner[2 * 8 + 2], a.owner[2 * 8 + 3]), (0, 0));
+        assert_eq!(a.owner[0], NO_PART, "outside stays empty");
+    }
+
+    #[test]
+    fn large_gaps_and_border_gaps_stay_empty() {
+        let mut a = grid(&["000000", "0....0", "0....0", "000000"]);
+        assert_eq!(a.fill_enclosed_gaps(7), 0, "8-px hole is larger than the limit");
+        assert_eq!(a.fill_enclosed_gaps(8), 8);
+        let mut b = grid(&["0..0", "0000"]);
+        assert_eq!(b.fill_enclosed_gaps(100), 0, "touches the border");
+        let mut bad = Assignment { width: 3, height: 3, owner: vec![0], coverage: vec![0] };
+        assert_eq!(bad.fill_enclosed_gaps(100), 0, "mismatched buffers are ignored, not indexed");
     }
 
     #[test]

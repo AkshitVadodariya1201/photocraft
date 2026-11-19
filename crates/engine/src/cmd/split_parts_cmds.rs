@@ -31,6 +31,10 @@ const DETAIL_SHARE: f32 = 0.35;
 const MAX_DETAIL_AREAS: usize = 8;
 /// Smallest side of a zoomed area, in document pixels.
 const MIN_DETAIL_SIDE: f32 = 256.0;
+/// Default largest hole filled, as a share of the image's pixels (0.03 %: about 5,200 px on a
+/// 17 MP photo). Thin unclaimed slivers between parts are far smaller; background showing through
+/// the figure (between an arm and the body) is usually larger and stays empty.
+const FILL_GAPS_SHARE: f64 = 0.0003;
 
 /// Zoomed areas for the small boxed parts, in document pixels, merged where they overlap: the box
 /// with a margin of half its size on every side (at least [`MIN_DETAIL_SIDE`]), inside the canvas.
@@ -220,6 +224,14 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
     if area.is_empty() {
         return Err(EngineError::Other("the canvas is empty".into()));
     }
+    let pixels_total = (area.width() as u64).saturating_mul(area.height() as u64);
+    let fill_gaps = match p.get("fillGaps") {
+        None | Some(Value::Null) => (pixels_total as f64 * FILL_GAPS_SHARE) as usize,
+        Some(v) => {
+            let n = v.as_u64().ok_or_else(|| bad("fillGaps must be a whole number of pixels (0 turns it off)"))?;
+            usize::try_from(n.min(pixels_total)).unwrap_or(usize::MAX)
+        }
+    };
     // Loading reads ~45 MB and parses both networks: do it before the job so a missing model
     // is reported at once.
     let model = load_model(p)?;
@@ -302,20 +314,30 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                     return Err(EngineError::Cancelled);
                 }
             }
-            let masks = ctx.stage(0.8, 0.95, "Building masks", |_| map.masks(area.x0 as i64, area.y0 as i64, w as usize, h as usize));
+            let mut assignment = ctx.stage(0.8, 0.9, "Building masks", |_| map.assign(area.x0 as i64, area.y0 as i64, w as usize, h as usize));
             if ctx.cancelled() {
                 return Err(EngineError::Cancelled);
             }
+            let filled = ctx.stage(0.9, 0.95, "Filling gaps", |_| assignment.fill_enclosed_gaps(fill_gaps));
 
             let source = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
             let LayerContent::Raster(pixels) = &source.content else { return Err(EngineError::Other("the layer is no longer a pixel layer".into())) };
             let pixels = pixels.clone();
 
+            // Parts that share a name (and group) are pieces of one layer: a drape and its border,
+            // a kurta and its hem. The layer takes the first piece's place.
+            let mut pieces: Vec<(&PartSpec, Vec<usize>)> = Vec::new();
+            for (i, part) in parts.iter().enumerate() {
+                match pieces.iter_mut().find(|(p, _)| p.name == part.name && p.group == part.group) {
+                    Some((_, list)) => list.push(i),
+                    None => pieces.push((part, vec![i])),
+                }
+            }
             // Groups in order of first mention; inside a group the first part listed is on top.
             let mut groups: Vec<(Option<String>, Vec<Layer>)> = Vec::new();
             let mut made = Vec::new();
-            for (part, cov) in parts.iter().zip(masks) {
-                let bytes: Vec<u8> = cov.iter().map(|c| (c.clamp(0.0, 1.0) * 255.0).round() as u8).collect();
+            for (part, list) in pieces {
+                let bytes = assignment.mask_of(&list);
                 if !bytes.iter().any(|b| *b > 0) {
                     made.push(json!({ "name": part.name, "layer": null, "pixels": 0 }));
                     continue;
@@ -356,9 +378,9 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             }
             doc.selection = None;
             *active = Some(top);
-            Ok(made)
+            Ok((made, filled))
         },
-        move |made| json!({ "source": id.0, "parts": made }),
+        move |(made, filled)| json!({ "source": id.0, "parts": made, "gapsFilled": filled }),
     )
 }
 
@@ -369,7 +391,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: "Split into Parts",
         menu: &[],
         shortcut: None,
-        params: r##"{"layer":id?,"parts":[{"name":str,"group":str?,"points":[[x,y,1|0],…]?,"box":[x,y,w,h]?},…] (document pixels; 1 include, 0 exclude; each part needs an include point or a box),"detail":bool=true (small boxed parts such as jewellery, straps and watches also get a zoomed analysis),"modelDir":str? (default PHOTOCRAFT_SAM_DIR: mobile_sam_image_encoder.onnx + sam_mask_decoder_single.onnx)} → {source, parts:[{name,group,layer,pixels}]} (each part becomes a masked copy of the layer inside its group; overlapping parts go to the strongest match; one undo step)"##,
+        params: r##"{"layer":id?,"parts":[{"name":str,"group":str?,"points":[[x,y,1|0],…]?,"box":[x,y,w,h]?},…] (document pixels; 1 include, 0 exclude; each part needs an include point or a box),"fillGaps":px? (largest enclosed unclaimed hole given to the part around it; default 0.03% of the image, 0 = off),"detail":bool=true (small boxed parts such as jewellery, straps and watches also get a zoomed analysis),"modelDir":str? (default PHOTOCRAFT_SAM_DIR: mobile_sam_image_encoder.onnx + sam_mask_decoder_single.onnx)} → {source, parts:[{name,group,layer,pixels}], gapsFilled} (each part becomes a masked copy of the layer inside its group; parts with the same name and group are pieces of one layer; overlapping parts go to the strongest match; one undo step)"##,
         enabled,
         run,
         journal: true,
@@ -447,6 +469,56 @@ mod tests {
         s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
         let r = s.execute(CMD, json!({"parts": [{"name": "A", "points": [[10, 10]]}], "modelDir": "Z:/no/such/folder"}));
         assert!(r.is_err());
+        for bad in [json!("x"), json!(-1), json!(1.5), json!({})] {
+            let r = s.execute(CMD, json!({"parts": [{"name": "A", "points": [[10, 10]]}], "fillGaps": bad}));
+            assert!(r.is_err(), "fillGaps {bad} should be rejected");
+        }
+        let r = s.execute(CMD, json!({"parts": [{"name": "A", "points": [[10, 10]]}], "detail": "yes"}));
+        assert!(r.is_err());
+    }
+
+    /// Two pieces with one name become one layer covering both (real model; skipped without it).
+    #[test]
+    fn pieces_with_one_name_make_one_layer() {
+        if std::env::var_os("PHOTOCRAFT_SAM_DIR").is_none() {
+            return;
+        }
+        let mut s = Session::new();
+        s.execute("file.new", json!({"width": 256, "height": 256})).unwrap();
+        s.edit("paint", |doc, _| {
+            let bg = doc.layers[0].surface_mut().unwrap();
+            let n = bg.channels();
+            let mut data = Vec::new();
+            for y in 0..256 {
+                for x in 0..256 {
+                    let red = (24..96).contains(&y) && ((24..96).contains(&x) || (160..232).contains(&x));
+                    let c = if red { [0.9, 0.1, 0.1] } else { [0.1, 0.3, 0.9] };
+                    data.extend_from_slice(&c[..n.min(3)]);
+                    if n == 4 {
+                        data.push(1.0);
+                    }
+                }
+            }
+            bg.write_region(photocraft_geom::Rect::new(0, 0, 256, 256), &data);
+            Ok(())
+        })
+        .unwrap();
+        let r = s
+            .execute(
+                CMD,
+                json!({"parts": [
+                    {"name": "Squares", "group": "Shapes", "points": [[60, 60], [196, 60, 0]]},
+                    {"name": "Squares", "group": "Shapes", "points": [[196, 60], [60, 60, 0]]}
+                ]}),
+            )
+            .unwrap();
+        let made = r["parts"].as_array().unwrap();
+        assert_eq!(made.len(), 1, "one layer for both pieces: {r}");
+        let px = made[0]["pixels"].as_u64().unwrap();
+        assert!((7_000..13_000).contains(&px), "both 72×72 squares: {px}");
+        let doc = &s.active().unwrap().doc;
+        let group = doc.layers.iter().find(|l| l.name == "Shapes").expect("group");
+        assert_eq!(group.children().map(|c| c.len()), Some(1));
     }
 
     /// End to end with the real model when `PHOTOCRAFT_SAM_DIR` is set (skipped otherwise):
