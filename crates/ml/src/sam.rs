@@ -39,6 +39,9 @@ pub struct Rgb<'a> {
     pub px: &'a [[f32; 3]],
     /// Width and height of the document area, in document pixels.
     pub source_size: (usize, usize),
+    /// Where that area starts, in the coordinates prompts use (0, 0 for the whole image; a crop's
+    /// corner for a zoomed detail analysis).
+    pub origin: (usize, usize),
 }
 
 /// Include or exclude a point.
@@ -99,6 +102,8 @@ impl SamModel {
         }
         let (src_w, src_h) = img.source_size;
         Ok(Embedding {
+            origin: (img.origin.0 as f32, img.origin.1 as f32),
+            extent: (src_w as f32, src_h as f32),
             embeddings,
             decoder: self.decoder.clone(),
             plans: HashMap::new(),
@@ -162,6 +167,9 @@ pub struct Embedding {
     frame: (usize, usize),
     /// Document pixels → frame pixels.
     scale: (f32, f32),
+    /// The analysed area: its corner and size in prompt coordinates.
+    origin: (f32, f32),
+    extent: (f32, f32),
 }
 
 impl Embedding {
@@ -175,21 +183,22 @@ impl Embedding {
         }
         let (sx, sy) = self.scale;
         let (fw, fh) = self.frame;
+        let (ox, oy) = self.origin;
         let mut coords: Vec<f32> = Vec::new();
         let mut labels: Vec<f32> = Vec::new();
         for &(x, y, label) in &prompt.points {
             if !x.is_finite() || !y.is_finite() {
                 return Err(MlError::Input("a point is not a number".into()));
             }
-            coords.extend([(x * sx).clamp(0.0, fw as f32), (y * sy).clamp(0.0, fh as f32)]);
+            coords.extend([((x - ox) * sx).clamp(0.0, fw as f32), ((y - oy) * sy).clamp(0.0, fh as f32)]);
             labels.push(if label == PointLabel::Include { 1.0 } else { 0.0 });
         }
         if let Some([x0, y0, x1, y1]) = prompt.rect {
             if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) || x1 <= x0 || y1 <= y0 {
                 return Err(MlError::Input("the box is empty or not a number".into()));
             }
-            coords.extend([(x0 * sx).clamp(0.0, fw as f32), (y0 * sy).clamp(0.0, fh as f32)]);
-            coords.extend([(x1 * sx).clamp(0.0, fw as f32), (y1 * sy).clamp(0.0, fh as f32)]);
+            coords.extend([((x0 - ox) * sx).clamp(0.0, fw as f32), ((y0 - oy) * sy).clamp(0.0, fh as f32)]);
+            coords.extend([((x1 - ox) * sx).clamp(0.0, fw as f32), ((y1 - oy) * sy).clamp(0.0, fh as f32)]);
             labels.extend([2.0, 3.0]);
         } else {
             // SAM expects a padding point when there is no box.
@@ -211,7 +220,7 @@ impl Embedding {
             return Err(MlError::Model(format!("unexpected mask shape {:?}", view.shape())));
         }
         let score = out.get(1).and_then(|t| t.to_plain_array_view::<f32>().ok()).and_then(|v| v.iter().next().copied()).unwrap_or(0.0);
-        Ok(Logits { width: fw, height: fh, scale: self.scale, data, score })
+        Ok(Logits { width: fw, height: fh, scale: self.scale, origin: self.origin, extent: self.extent, data, score })
     }
 
     /// The decoder plan for `n` prompt points (built once per count: the decoder's last resize
@@ -243,14 +252,24 @@ pub struct Logits {
     pub height: usize,
     /// Document pixels → frame pixels.
     pub scale: (f32, f32),
+    /// The analysed area (corner and size, prompt coordinates); outside it these logits say nothing.
+    pub origin: (f32, f32),
+    pub extent: (f32, f32),
     pub data: Vec<f32>,
     /// The decoder's own quality estimate (predicted IoU).
     pub score: f32,
 }
 
 impl Logits {
+    /// Whether pixel (`x`, `y`) lies in the analysed area.
+    fn covers(&self, x: f32, y: f32) -> bool {
+        let (dx, dy) = (x - self.origin.0, y - self.origin.1);
+        dx >= 0.0 && dy >= 0.0 && dx < self.extent.0 && dy < self.extent.1
+    }
+
     /// Bilinear logit at a document pixel centre.
     fn at(&self, x: f32, y: f32) -> f32 {
+        let (x, y) = (x - self.origin.0, y - self.origin.1);
         let fx = ((x + 0.5) * self.scale.0 - 0.5).clamp(0.0, (self.width.saturating_sub(1)) as f32);
         let fy = ((y + 0.5) * self.scale.1 - 0.5).clamp(0.0, (self.height.saturating_sub(1)) as f32);
         let (x0, y0) = (fx.floor() as usize, fy.floor() as usize);
@@ -265,8 +284,23 @@ impl Logits {
 
 /// Several parts' logits resolved against each other: each pixel goes to the part with the
 /// highest logit, and only when that logit says "inside".
+///
+/// A part may also have detail logits from a zoomed analysis of a small area (thin straps, chains
+/// and jewellery are below the whole-image analysis's resolution). For the small item the area
+/// was made for they replace its whole-image logits there ([`Detail::Replace`]); for the other
+/// parts in the area they only add sharpness ([`Detail::Refine`]: the higher of the two), because
+/// a zoomed prompt may hold just a few of such a part's points and see only a piece of it.
 pub struct PartMap {
-    parts: Vec<Logits>,
+    parts: Vec<Vec<(Logits, Detail)>>,
+}
+
+/// How zoomed detail logits combine with a part's whole-image logits inside their area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Detail {
+    /// Use the detail logits alone (the small item the zoomed area was made for).
+    Replace,
+    /// Use the higher of the detail and whole-image logits (other parts in the area).
+    Refine,
 }
 
 impl PartMap {
@@ -277,7 +311,17 @@ impl PartMap {
         if parts.len() > MAX_PARTS {
             return Err(MlError::Input(format!("at most {MAX_PARTS} parts")));
         }
-        Ok(PartMap { parts })
+        Ok(PartMap { parts: parts.into_iter().map(|l| vec![(l, Detail::Replace)]).collect() })
+    }
+
+    /// Add zoomed detail logits for part `part`.
+    pub fn add_detail(&mut self, part: usize, logits: Logits, how: Detail) -> Result<()> {
+        let list = self.parts.get_mut(part).ok_or_else(|| MlError::Input(format!("no part {part}")))?;
+        if list.len() > MAX_PARTS {
+            return Err(MlError::Input("too many detail areas".into()));
+        }
+        list.push((logits, how));
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -289,10 +333,42 @@ impl PartMap {
     }
 
     /// The part owning document pixel (`x`, `y`) and its coverage (`0..=1`, soft at edges).
+    ///
+    /// Where a zoomed small item ([`Detail::Replace`]) claims the pixel, only zoomed results
+    /// compete, at the same sharpness (a chain against the skin under it). Elsewhere every part
+    /// uses the higher of its whole-image and zoomed ([`Detail::Refine`]) logits.
     pub fn at(&self, x: f32, y: f32) -> Option<(usize, f32)> {
+        // Per part: whole-image, zoomed-item and zoomed-refine logits at this pixel.
+        let mut vals: Vec<(f32, Option<f32>, Option<f32>)> = Vec::with_capacity(self.parts.len());
+        for layers in &self.parts {
+            let Some((base, _)) = layers.first() else {
+                vals.push((f32::NEG_INFINITY, None, None));
+                continue;
+            };
+            let (mut item, mut refine) = (None::<f32>, None::<f32>);
+            for (l, how) in layers.iter().skip(1).filter(|(l, _)| l.covers(x, y)) {
+                let d = l.at(x, y);
+                match how {
+                    Detail::Replace => item = Some(item.map_or(d, |v| v.max(d))),
+                    Detail::Refine => refine = Some(refine.map_or(d, |v| v.max(d))),
+                }
+            }
+            vals.push((base.at(x, y), item, refine));
+        }
+        let claimed = vals.iter().any(|(_, item, _)| item.is_some_and(|v| v > 0.0));
         let mut best: Option<(usize, f32)> = None;
-        for (i, p) in self.parts.iter().enumerate() {
-            let v = p.at(x, y);
+        for (i, &(whole, item, refine)) in vals.iter().enumerate() {
+            let v = if claimed {
+                match item.or(refine) {
+                    Some(v) => v,
+                    None => continue,
+                }
+            } else {
+                match item {
+                    Some(v) => v,
+                    None => refine.map_or(whole, |r| whole.max(r)),
+                }
+            };
             if best.is_none_or(|(_, b)| v > b) {
                 best = Some((i, v));
             }
@@ -335,22 +411,30 @@ mod tests {
     use super::*;
 
     fn logits(w: usize, h: usize, f: impl Fn(usize, usize) -> f32) -> Logits {
-        Logits { width: w, height: h, scale: (1.0, 1.0), data: (0..w * h).map(|i| f(i % w, i / w)).collect(), score: 1.0 }
+        Logits {
+            width: w,
+            height: h,
+            scale: (1.0, 1.0),
+            origin: (0.0, 0.0),
+            extent: (w as f32, h as f32),
+            data: (0..w * h).map(|i| f(i % w, i / w)).collect(),
+            score: 1.0,
+        }
     }
 
     #[test]
     fn frame_keeps_aspect_with_long_side_1024() {
         let px = vec![[0.5; 3]; 30 * 40];
-        let img = Rgb { width: 30, height: 40, px: &px, source_size: (3584, 4800) };
+        let img = Rgb { width: 30, height: 40, px: &px, source_size: (3584, 4800), origin: (0, 0) };
         assert_eq!(frame_size(&img).unwrap(), (765, 1024));
     }
 
     #[test]
     fn mismatched_or_empty_images_are_errors_not_panics() {
         let px = vec![[0.5; 3]; 10];
-        assert!(frame_size(&Rgb { width: 4, height: 4, px: &px, source_size: (4, 4) }).is_err());
-        assert!(frame_size(&Rgb { width: 0, height: 4, px: &[], source_size: (0, 4) }).is_err());
-        assert!(frame_size(&Rgb { width: 1, height: 1, px: &px[..1], source_size: (usize::MAX, 1) }).is_err());
+        assert!(frame_size(&Rgb { width: 4, height: 4, px: &px, source_size: (4, 4), origin: (0, 0) }).is_err());
+        assert!(frame_size(&Rgb { width: 0, height: 4, px: &[], source_size: (0, 4), origin: (0, 0) }).is_err());
+        assert!(frame_size(&Rgb { width: 1, height: 1, px: &px[..1], source_size: (usize::MAX, 1), origin: (0, 0) }).is_err());
     }
 
     #[test]
@@ -365,6 +449,45 @@ mod tests {
         assert_eq!(masks.len(), 2);
         assert!(masks[0][1] > 0.99 && masks[1][1] == 0.0);
         assert!(masks[1][8] > 0.99 && masks[0][8] == 0.0);
+    }
+
+    #[test]
+    fn detail_logits_replace_the_whole_image_inside_their_area_only() {
+        // Whole image: part 0 wins everywhere. Detail for part 1 over x 4..8: it wins there.
+        let mut map = PartMap::new(vec![logits(10, 1, |_, _| 5.0), logits(10, 1, |_, _| -5.0)]).unwrap();
+        let mut d = logits(4, 1, |_, _| 9.0);
+        d.origin = (4.0, 0.0);
+        map.add_detail(1, d.clone(), Detail::Replace).unwrap();
+        assert_eq!(map.at(2.0, 0.0).map(|p| p.0), Some(0));
+        assert_eq!(map.at(5.0, 0.0).map(|p| p.0), Some(1));
+        assert_eq!(map.at(9.0, 0.0).map(|p| p.0), Some(0));
+        assert!(map.add_detail(7, logits(1, 1, |_, _| 0.0), Detail::Refine).is_err());
+        // Refine never loses what the whole image found: a zoomed prompt that sees only part of
+        // part 0 (negative logits) leaves part 0 owning the area.
+        let mut map = PartMap::new(vec![logits(10, 1, |_, _| 5.0)]).unwrap();
+        let mut partial = logits(4, 1, |_, _| -9.0);
+        partial.origin = (4.0, 0.0);
+        map.add_detail(0, partial.clone(), Detail::Refine).unwrap();
+        assert_eq!(map.at(5.0, 0.0).map(|p| p.0), Some(0));
+        let mut map = PartMap::new(vec![logits(10, 1, |_, _| 5.0)]).unwrap();
+        map.add_detail(0, partial, Detail::Replace).unwrap();
+        assert_eq!(map.at(5.0, 0.0), None);
+    }
+
+    #[test]
+    fn a_zoomed_item_wins_over_the_part_under_it_only_where_it_claims_pixels() {
+        // Skin is strongly inside everywhere at whole-image scale; a zoomed chain claims x 4..6,
+        // and the zoomed skin excludes the chain there.
+        let mut map = PartMap::new(vec![logits(10, 1, |_, _| 9.0), logits(10, 1, |_, _| -9.0)]).unwrap();
+        let mut skin = logits(6, 1, |x, _| if (2..4).contains(&x) { -6.0 } else { 6.0 });
+        skin.origin = (2.0, 0.0);
+        let mut chain = logits(6, 1, |x, _| if (2..4).contains(&x) { 4.0 } else { -6.0 });
+        chain.origin = (2.0, 0.0);
+        map.add_detail(0, skin, Detail::Refine).unwrap();
+        map.add_detail(1, chain, Detail::Replace).unwrap();
+        assert_eq!(map.at(4.0, 0.0).map(|p| p.0), Some(1), "the chain");
+        assert_eq!(map.at(6.0, 0.0).map(|p| p.0), Some(0), "skin beside it");
+        assert_eq!(map.at(0.0, 0.0).map(|p| p.0), Some(0), "skin outside the zoomed area");
     }
 
     #[test]
@@ -400,7 +523,7 @@ mod tests {
                 if (64..192).contains(&x) && (64..192).contains(&y) { [0.9, 0.1, 0.1] } else { [0.1, 0.3, 0.9] }
             })
             .collect();
-        let mut emb = model.embed(&Rgb { width: w, height: h, px: &px, source_size: (w, h) }).unwrap();
+        let mut emb = model.embed(&Rgb { width: w, height: h, px: &px, source_size: (w, h), origin: (0, 0) }).unwrap();
         let l = emb.logits(&Prompt { points: vec![(128.0, 128.0, PointLabel::Include)], rect: None }).unwrap();
         let map = PartMap::new(vec![l]).unwrap();
         assert!(map.at(128.0, 128.0).is_some(), "centre of the square is inside");

@@ -24,6 +24,53 @@ pub const DECODER_FILE: &str = "sam_mask_decoder_single.onnx";
 /// downsampling clean).
 const ANALYSIS_SIDE: i64 = 2048;
 const MAX_NAME: usize = 120;
+/// A boxed part this small (long side, as a share of the image's long side) also gets a zoomed
+/// analysis: thin straps, chains and jewellery are below the whole-image analysis's resolution.
+const DETAIL_SHARE: f32 = 0.35;
+/// Most zoomed analyses per split (each costs about as much as the whole-image one).
+const MAX_DETAIL_AREAS: usize = 8;
+/// Smallest side of a zoomed area, in document pixels.
+const MIN_DETAIL_SIDE: f32 = 256.0;
+
+/// Zoomed areas for the small boxed parts, in document pixels, merged where they overlap: the box
+/// with a margin of half its size on every side (at least [`MIN_DETAIL_SIDE`]), inside the canvas.
+fn detail_regions(parts: &[PartSpec], area: photocraft_geom::Rect) -> Vec<photocraft_geom::Rect> {
+    use photocraft_geom::Rect;
+    let long = area.width().max(area.height()) as f32;
+    let mut regions: Vec<Rect> = Vec::new();
+    for part in parts {
+        let Some([x0, y0, x1, y1]) = part.rect else { continue };
+        let (bw, bh) = (x1 - x0, y1 - y0);
+        if bw.max(bh) > DETAIL_SHARE * long {
+            continue;
+        }
+        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        let (hx, hy) = ((bw * 2.0).max(MIN_DETAIL_SIDE) / 2.0, (bh * 2.0).max(MIN_DETAIL_SIDE) / 2.0);
+        let r = Rect::new((cx - hx).floor() as i32, (cy - hy).floor() as i32, (cx + hx).ceil() as i32, (cy + hy).ceil() as i32).intersect(&area);
+        if r.is_empty() {
+            continue;
+        }
+        // Merge with every overlapping area, repeating so chains of overlaps join.
+        let mut merged = r;
+        loop {
+            let before = regions.len();
+            regions.retain(|o| {
+                if o.intersect(&merged).is_empty() {
+                    true
+                } else {
+                    merged = merged.union(o);
+                    false
+                }
+            });
+            if regions.len() == before {
+                break;
+            }
+        }
+        regions.push(merged);
+    }
+    regions.truncate(MAX_DETAIL_AREAS);
+    regions
+}
 
 fn bad(msg: impl Into<String>) -> EngineError {
     EngineError::BadParams { cmd: CMD.into(), msg: msg.into() }
@@ -157,11 +204,15 @@ fn run(_s: &mut Session, _p: &Value) -> Result<Value> {
 #[cfg(not(target_arch = "wasm32"))]
 fn run(s: &mut Session, p: &Value) -> Result<Value> {
     use photocraft_geom::Rect;
-    use photocraft_ml::{PartMap, PointLabel, Prompt, Rgb};
+    use photocraft_ml::{Detail, PartMap, PointLabel, Prompt, Rgb};
 
     use crate::smartselect_cmds::with_doc_sampler;
 
     let parts = parse_parts(p)?;
+    let detail = match p.get("detail") {
+        None | Some(Value::Null) => true,
+        Some(v) => v.as_bool().ok_or_else(|| bad("detail must be true or false"))?,
+    };
     let id = layer_param(s, p)?;
     let doc = &s.active().ok_or(EngineError::NoDocument)?.doc;
     check(doc, id).map_err(EngineError::Other)?;
@@ -181,7 +232,9 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             let step = ((w.max(h) + ANALYSIS_SIDE - 1) / ANALYSIS_SIDE).max(1) as usize;
             let img = with_doc_sampler(doc, Some(id), false, |smp, _| smp.rgb_scaled(area, step));
             let mut emb = ctx
-                .stage(0.0, 0.5, "Analysing image", |_| model.embed(&Rgb { width: img.w, height: img.h, px: &img.px, source_size: (w as usize, h as usize) }))
+                .stage(0.0, 0.5, "Analysing image", |_| {
+                    model.embed(&Rgb { width: img.w, height: img.h, px: &img.px, source_size: (w as usize, h as usize), origin: (0, 0) })
+                })
                 .map_err(|e| EngineError::Other(e.to_string()))?;
             if ctx.cancelled() {
                 return Err(EngineError::Cancelled);
@@ -189,7 +242,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             let mut logits = Vec::with_capacity(parts.len());
             let n = parts.len() as f32;
             for (i, part) in parts.iter().enumerate() {
-                let (a, b) = (0.5 + 0.3 * i as f32 / n, 0.5 + 0.3 * (i + 1) as f32 / n);
+                let (a, b) = (0.5 + 0.2 * i as f32 / n, 0.5 + 0.2 * (i + 1) as f32 / n);
                 let prompt = Prompt {
                     points: part
                         .points
@@ -206,7 +259,49 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                     return Err(EngineError::Cancelled);
                 }
             }
-            let map = PartMap::new(logits).map_err(|e| EngineError::Other(e.to_string()))?;
+            let mut map = PartMap::new(logits).map_err(|e| EngineError::Other(e.to_string()))?;
+
+            // Zoomed detail for small boxed parts: inside each area, every part with a prompt
+            // there is analysed again at the area's own resolution, so a strap competes with the
+            // skin under it at the same sharpness.
+            let regions = if detail { detail_regions(&parts, area) } else { Vec::new() };
+            let nr = regions.len().max(1) as f32;
+            for (ri, r) in regions.iter().enumerate() {
+                let (a, b) = (0.7 + 0.1 * ri as f32 / nr, 0.7 + 0.1 * (ri + 1) as f32 / nr);
+                let (rw, rh) = (r.width() as i64, r.height() as i64);
+                let rstep = ((rw.max(rh) + ANALYSIS_SIDE - 1) / ANALYSIS_SIDE).max(1) as usize;
+                let crop = with_doc_sampler(doc, Some(id), false, |smp, _| smp.rgb_scaled(*r, rstep));
+                let origin = ((r.x0 - area.x0).max(0) as usize, (r.y0 - area.y0).max(0) as usize);
+                let mut demb = ctx
+                    .stage(a, b, "Analysing details", |_| {
+                        model.embed(&Rgb { width: crop.w, height: crop.h, px: &crop.px, source_size: (rw as usize, rh as usize), origin })
+                    })
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
+                let inside = |x: f32, y: f32| x >= r.x0 as f32 && y >= r.y0 as f32 && x < r.x1 as f32 && y < r.y1 as f32;
+                for (i, part) in parts.iter().enumerate() {
+                    let points: Vec<_> = part
+                        .points
+                        .iter()
+                        .filter(|&&(x, y, _)| inside(x, y))
+                        .map(|&(x, y, inc)| (x - area.x0 as f32, y - area.y0 as f32, if inc { PointLabel::Include } else { PointLabel::Exclude }))
+                        .collect();
+                    let rect = part
+                        .rect
+                        .filter(|&[x0, y0, x1, y1]| inside(x0, y0) && inside(x1 - 1.0, y1 - 1.0))
+                        .map(|[x0, y0, x1, y1]| [x0 - area.x0 as f32, y0 - area.y0 as f32, x1 - area.x0 as f32, y1 - area.y0 as f32]);
+                    if rect.is_none() && !points.iter().any(|p| p.2 == PointLabel::Include) {
+                        continue;
+                    }
+                    let l = demb.logits(&Prompt { points, rect }).map_err(|e| EngineError::Other(format!("{}: {e}", part.name)))?;
+                    // The small item this area was made for trusts its zoomed result alone; the
+                    // other parts here only gain sharpness from it.
+                    let how = if rect.is_some() { Detail::Replace } else { Detail::Refine };
+                    map.add_detail(i, l, how).map_err(|e| EngineError::Other(e.to_string()))?;
+                }
+                if ctx.cancelled() {
+                    return Err(EngineError::Cancelled);
+                }
+            }
             let masks = ctx.stage(0.8, 0.95, "Building masks", |_| map.masks(area.x0 as i64, area.y0 as i64, w as usize, h as usize));
             if ctx.cancelled() {
                 return Err(EngineError::Cancelled);
@@ -274,7 +369,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: "Split into Parts",
         menu: &[],
         shortcut: None,
-        params: r##"{"layer":id?,"parts":[{"name":str,"group":str?,"points":[[x,y,1|0],…]?,"box":[x,y,w,h]?},…] (document pixels; 1 include, 0 exclude; each part needs an include point or a box),"modelDir":str? (default PHOTOCRAFT_SAM_DIR: mobile_sam_image_encoder.onnx + sam_mask_decoder_single.onnx)} → {source, parts:[{name,group,layer,pixels}]} (each part becomes a masked copy of the layer inside its group; overlapping parts go to the strongest match; one undo step)"##,
+        params: r##"{"layer":id?,"parts":[{"name":str,"group":str?,"points":[[x,y,1|0],…]?,"box":[x,y,w,h]?},…] (document pixels; 1 include, 0 exclude; each part needs an include point or a box),"detail":bool=true (small boxed parts such as jewellery, straps and watches also get a zoomed analysis),"modelDir":str? (default PHOTOCRAFT_SAM_DIR: mobile_sam_image_encoder.onnx + sam_mask_decoder_single.onnx)} → {source, parts:[{name,group,layer,pixels}]} (each part becomes a masked copy of the layer inside its group; overlapping parts go to the strongest match; one undo step)"##,
         enabled,
         run,
         journal: true,
@@ -319,6 +414,31 @@ mod tests {
         }
         let many: Vec<Value> = (0..=photocraft_ml_limits::MAX_PARTS).map(|i| json!({"name": format!("P{i}"), "points": [[1, 1]]})).collect();
         assert!(parse_parts(&json!({ "parts": many })).is_err());
+    }
+
+    #[test]
+    fn small_boxes_get_merged_zoom_areas_and_large_ones_none() {
+        let area = photocraft_geom::Rect::new(0, 0, 3584, 4800);
+        let p = |name: &str, b: [f32; 4]| PartSpec { name: name.into(), group: None, points: vec![], rect: Some(b) };
+        let parts = vec![
+            p("Earring L", [1660.0, 790.0, 1710.0, 910.0]),
+            p("Earring R", [1990.0, 710.0, 2050.0, 860.0]),
+            p("Sandal", [1000.0, 4200.0, 1420.0, 4700.0]),
+            p("Dress", [500.0, 1000.0, 3000.0, 4500.0]),
+        ];
+        let r = detail_regions(&parts, area);
+        // Each earring and the sandal get an area; the dress is too large for one.
+        assert_eq!(r.len(), 3, "{r:?}");
+        // Boxes whose areas overlap share one merged area.
+        let close = [p("Ring", [1000.0, 1000.0, 1040.0, 1040.0]), p("Bangle", [1100.0, 1000.0, 1180.0, 1060.0])];
+        let m = detail_regions(&close, area);
+        assert_eq!(m.len(), 1, "{m:?}");
+        assert!(m[0].x0 <= 1000 && m[0].x1 >= 1180);
+        assert!(r.iter().all(|x| x.width() >= 256 && x.height() >= 256 && area.intersect(x) == *x));
+        assert!(detail_regions(&[p("Big", [0.0, 0.0, 3584.0, 4800.0])], area).is_empty());
+        let many: Vec<_> = (0..20).map(|i| p("x", [i as f32 * 170.0, 0.0, i as f32 * 170.0 + 10.0, 10.0])).collect();
+        assert!(detail_regions(&many, area).len() <= MAX_DETAIL_AREAS);
+        assert!(parse_parts(&json!({"parts": [{"name": "A", "points": [[1, 1]]}], "detail": "x"})).is_ok());
     }
 
     #[test]

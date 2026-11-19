@@ -9,7 +9,7 @@
 
 mod sam;
 
-pub use sam::{Embedding, Logits, MAX_PARTS, MAX_POINTS, PartMap, PointLabel, Prompt, Rgb, SAM_SIDE, SamModel};
+pub use sam::{Detail, Embedding, Logits, MAX_PARTS, MAX_POINTS, PartMap, PointLabel, Prompt, Rgb, SAM_SIDE, SamModel};
 
 /// Errors from loading or running a model.
 #[derive(Debug, Clone, PartialEq, Eq)]
