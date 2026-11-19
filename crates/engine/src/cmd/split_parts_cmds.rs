@@ -35,6 +35,8 @@ const MIN_DETAIL_SIDE: f32 = 256.0;
 /// 17 MP photo). Thin unclaimed slivers between parts are far smaller; background showing through
 /// the figure (between an arm and the body) is usually larger and stays empty.
 const FILL_GAPS_SHARE: f64 = 0.0003;
+/// Most edge-refinement band, in document pixels.
+const MAX_REFINE_EDGE: f64 = 64.0;
 
 /// Zoomed areas for the small boxed parts, in document pixels, merged where they overlap: the box
 /// with a margin of half its size on every side (at least [`MIN_DETAIL_SIDE`]), inside the canvas.
@@ -225,6 +227,16 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other("the canvas is empty".into()));
     }
     let pixels_total = (area.width() as u64).saturating_mul(area.height() as u64);
+    // The model's masks are enlarged from a 1024 px analysis, which blurs the outline by a few
+    // enlargement steps: refine it against the photo over about 2.5 of them by default.
+    let long_side = area.width().max(area.height()) as f64;
+    let refine_edge = match p.get("refineEdge") {
+        None | Some(Value::Null) => (long_side / photocraft_ml::SAM_SIDE as f64 * 2.5).clamp(2.0, 24.0),
+        Some(v) => {
+            let n = v.as_f64().filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(|| bad("refineEdge must be a number of pixels, 0 or more"))?;
+            n.min(MAX_REFINE_EDGE)
+        }
+    };
     let fill_gaps = match p.get("fillGaps") {
         None | Some(Value::Null) => (pixels_total as f64 * FILL_GAPS_SHARE) as usize,
         Some(v) => {
@@ -318,7 +330,43 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             if ctx.cancelled() {
                 return Err(EngineError::Cancelled);
             }
-            let filled = ctx.stage(0.9, 0.95, "Filling gaps", |_| assignment.fill_enclosed_gaps(fill_gaps));
+            // Sharpen the figure's outline against the photo (the same edge refinement as Select and
+            // Mask); pixels it adds go to the nearest part, pixels it drops leave every part.
+            let mut edge_added = 0usize;
+            if refine_edge > 0.0 {
+                let outline = assignment.outline();
+                let mut surface =
+                    photocraft_raster::Surface::from_interleaved(photocraft_color::PixelFormat::GRAY8, Rect::new(area.x0, area.y0, area.x1, area.y1), &outline);
+                surface.prune();
+                let params = photocraft_algo::matting::RefineParams {
+                    radius: refine_edge as f32,
+                    smart_radius: true,
+                    smooth: 10.0,
+                    feather: 0.5,
+                    contrast: 10.0,
+                    shift_edge: 0.0,
+                };
+                let refined = ctx
+                    .stage(0.85, 0.9, "Refining edges", |interrupt| {
+                        with_doc_sampler(doc, Some(id), false, |smp, _| {
+                            photocraft_algo::matting::refine_surface_with_interrupt(smp, &surface, area, &params, None, interrupt)
+                        })
+                    })
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
+                if ctx.cancelled() {
+                    return Err(EngineError::Cancelled);
+                }
+                if let Some(refined) = refined {
+                    let alpha = refined.to_interleaved(Rect::new(area.x0, area.y0, area.x1, area.y1));
+                    if alpha.len() == outline.len() {
+                        edge_added = assignment.apply_outline(&alpha, (refine_edge * 2.0).ceil() as usize);
+                    }
+                }
+            }
+            // Stray pieces of a part inside another (a speck of kurta in the dupatta) join the
+            // part around them; then small holes are filled. Both use the fillGaps size limit.
+            let islands_moved = ctx.stage(0.9, 0.93, "Cleaning stray pieces", |_| assignment.reassign_islands(fill_gaps));
+            let filled = ctx.stage(0.93, 0.95, "Filling gaps", |_| assignment.fill_enclosed_gaps(fill_gaps));
 
             let source = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
             let LayerContent::Raster(pixels) = &source.content else { return Err(EngineError::Other("the layer is no longer a pixel layer".into())) };
@@ -378,9 +426,9 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             }
             doc.selection = None;
             *active = Some(top);
-            Ok((made, filled))
+            Ok((made, filled, edge_added, islands_moved))
         },
-        move |(made, filled)| json!({ "source": id.0, "parts": made, "gapsFilled": filled }),
+        move |(made, filled, edge_added, islands_moved)| json!({ "source": id.0, "parts": made, "gapsFilled": filled, "edgeAdded": edge_added, "islandsMoved": islands_moved }),
     )
 }
 
@@ -391,7 +439,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: "Split into Parts",
         menu: &[],
         shortcut: None,
-        params: r##"{"layer":id?,"parts":[{"name":str,"group":str?,"points":[[x,y,1|0],…]?,"box":[x,y,w,h]?},…] (document pixels; 1 include, 0 exclude; each part needs an include point or a box),"fillGaps":px? (largest enclosed unclaimed hole given to the part around it; default 0.03% of the image, 0 = off),"detail":bool=true (small boxed parts such as jewellery, straps and watches also get a zoomed analysis),"modelDir":str? (default PHOTOCRAFT_SAM_DIR: mobile_sam_image_encoder.onnx + sam_mask_decoder_single.onnx)} → {source, parts:[{name,group,layer,pixels}], gapsFilled} (each part becomes a masked copy of the layer inside its group; parts with the same name and group are pieces of one layer; overlapping parts go to the strongest match; one undo step)"##,
+        params: r##"{"layer":id?,"parts":[{"name":str,"group":str?,"points":[[x,y,1|0],…]?,"box":[x,y,w,h]?},…] (document pixels; 1 include, 0 exclude; each part needs an include point or a box),"refineEdge":px? (outline refined against the photo over this band; default about 2.5× the analysis's enlargement, 0 = off),"fillGaps":px? (largest enclosed unclaimed hole given to the part around it, and largest stray piece of a part moved to the part around it; default 0.03% of the image, 0 = off),"detail":bool=true (small boxed parts such as jewellery, straps and watches also get a zoomed analysis),"modelDir":str? (default PHOTOCRAFT_SAM_DIR: mobile_sam_image_encoder.onnx + sam_mask_decoder_single.onnx)} → {source, parts:[{name,group,layer,pixels}], gapsFilled, edgeAdded, islandsMoved} (each part becomes a masked copy of the layer inside its group; parts with the same name and group are pieces of one layer; overlapping parts go to the strongest match; one undo step)"##,
         enabled,
         run,
         journal: true,
@@ -475,6 +523,10 @@ mod tests {
         }
         let r = s.execute(CMD, json!({"parts": [{"name": "A", "points": [[10, 10]]}], "detail": "yes"}));
         assert!(r.is_err());
+        for bad in [json!("x"), json!(-1), json!({})] {
+            let r = s.execute(CMD, json!({"parts": [{"name": "A", "points": [[10, 10]]}], "refineEdge": bad}));
+            assert!(r.is_err(), "refineEdge {bad} should be rejected");
+        }
     }
 
     /// Two pieces with one name become one layer covering both (real model; skipped without it).

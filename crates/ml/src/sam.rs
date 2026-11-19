@@ -429,6 +429,152 @@ impl Assignment {
         self.owner.iter().zip(&self.coverage).map(|(o, c)| if parts.iter().any(|p| *p == usize::from(*o)) { *c } else { 0 }).collect()
     }
 
+    /// The union of all parts as a hard 8-bit mask (255 where a part covers at least half), the
+    /// input [`Self::apply_outline`]'s refinement expects: refining an already blurred mask
+    /// keeps its blur, while a hard one gets its soft edge from the photo itself.
+    pub fn outline(&self) -> Vec<u8> {
+        self.owner.iter().zip(&self.coverage).map(|(o, c)| if *o != NO_PART && *c >= 128 { 255 } else { 0 }).collect()
+    }
+
+    /// Move small stray pieces to the part around them: a connected piece of a part (4-connected,
+    /// at least half covered) that is at most `max_px` pixels and under 2 % of that part's
+    /// largest piece goes to the part owning at least 80 % of its rim (uncovered pixels count
+    /// in the rim too, so a piece at the figure's edge, such as toes between sandal straps, stays).
+    /// Returns the pixels moved.
+    pub fn reassign_islands(&mut self, max_px: usize) -> usize {
+        let (w, h) = (self.width, self.height);
+        let n = w.saturating_mul(h);
+        if max_px == 0 || n == 0 || self.owner.len() != n || self.coverage.len() != n {
+            return 0;
+        }
+        let solid = |o: u16, c: u8| o != NO_PART && c >= 128;
+        // Pass 1: label pieces and measure them.
+        let mut label = vec![u32::MAX; n];
+        let mut pieces: Vec<(u16, usize, usize)> = Vec::new(); // owner, size, a pixel in it
+        let mut stack = Vec::new();
+        for start in 0..n {
+            if label[start] != u32::MAX || !solid(self.owner[start], self.coverage[start]) {
+                continue;
+            }
+            let Ok(id) = u32::try_from(pieces.len()) else { return 0 };
+            let o = self.owner[start];
+            label[start] = id;
+            stack.push(start);
+            let mut size = 0usize;
+            while let Some(i) = stack.pop() {
+                size += 1;
+                let (x, y) = (i % w, i / w);
+                for j in [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)].into_iter().flatten() {
+                    if label[j] == u32::MAX && self.owner[j] == o && self.coverage[j] >= 128 {
+                        label[j] = id;
+                        stack.push(j);
+                    }
+                }
+            }
+            pieces.push((o, size, start));
+        }
+        let mut largest = [0usize; 65];
+        for &(o, size, _) in &pieces {
+            if let Some(l) = largest.get_mut(usize::from(o)) {
+                *l = (*l).max(size);
+            }
+        }
+        // Pass 2: small pieces whose rim is mostly one other part move to it.
+        let mut moved = 0usize;
+        let mut members = Vec::new();
+        for (id, &(o, size, seed)) in pieces.iter().enumerate() {
+            let big = largest.get(usize::from(o)).copied().unwrap_or(0);
+            if size > max_px || size.saturating_mul(50) >= big {
+                continue;
+            }
+            let Ok(id) = u32::try_from(id) else { break };
+            let mut rim = [0u32; 66]; // 0..64 parts, 65 = uncovered / image edge
+            members.clear();
+            stack.push(seed);
+            let mut seen = std::collections::HashSet::new();
+            seen.insert(seed);
+            while let Some(i) = stack.pop() {
+                members.push(i);
+                let (x, y) = (i % w, i / w);
+                let around = [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
+                if around.iter().any(Option::is_none) {
+                    rim[65] += 1;
+                }
+                for j in around.into_iter().flatten() {
+                    if label[j] == id {
+                        if seen.insert(j) {
+                            stack.push(j);
+                        }
+                    } else if solid(self.owner[j], self.coverage[j]) {
+                        if let Some(r) = rim.get_mut(usize::from(self.owner[j]).min(64)) {
+                            *r += 1;
+                        }
+                    } else {
+                        rim[65] += 1;
+                    }
+                }
+            }
+            let total: u32 = rim.iter().sum();
+            let Some((best, count)) = rim.iter().enumerate().take(65).filter(|(p, _)| *p != usize::from(o)).max_by_key(|(_, c)| **c) else { continue };
+            if total == 0 || (*count as f64) < 0.8 * total as f64 {
+                continue;
+            }
+            let Ok(best) = u16::try_from(best) else { continue };
+            for &i in &members {
+                self.owner[i] = best;
+            }
+            moved += members.len();
+        }
+        moved
+    }
+
+    /// Take the figure's outline from a refined `alpha` (same size): every pixel's coverage
+    /// becomes `alpha`; pixels the refined outline drops lose their owner, and pixels it adds go
+    /// to the nearest part, at most `reach` steps away (4-connected, breadth first from every
+    /// owned pixel), so an edge sharpened against the photo keeps each part's own colours.
+    /// Returns the pixels added.
+    pub fn apply_outline(&mut self, alpha: &[u8], reach: usize) -> usize {
+        let (w, h) = (self.width, self.height);
+        let n = w.saturating_mul(h);
+        if n == 0 || alpha.len() != n || self.owner.len() != n || self.coverage.len() != n {
+            return 0;
+        }
+        // Breadth-first from all owned pixels the outline keeps, through unowned outline pixels.
+        let mut dist = vec![u16::MAX; n];
+        let mut queue = std::collections::VecDeque::new();
+        for i in 0..n {
+            if alpha[i] == 0 {
+                self.owner[i] = NO_PART;
+                self.coverage[i] = 0;
+            } else if self.owner[i] != NO_PART {
+                dist[i] = 0;
+                queue.push_back(i);
+            }
+        }
+        let reach = u16::try_from(reach.min(u16::MAX as usize - 1)).unwrap_or(0);
+        let mut added = 0usize;
+        while let Some(i) = queue.pop_front() {
+            let d = dist[i];
+            if d >= reach {
+                continue;
+            }
+            let (x, y) = (i % w, i / w);
+            let neighbours = [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)];
+            for j in neighbours.into_iter().flatten() {
+                if alpha[j] > 0 && self.owner[j] == NO_PART && dist[j] == u16::MAX {
+                    dist[j] = d + 1;
+                    self.owner[j] = self.owner[i];
+                    added += 1;
+                    queue.push_back(j);
+                }
+            }
+        }
+        for i in 0..n {
+            self.coverage[i] = if self.owner[i] == NO_PART { 0 } else { alpha[i] };
+        }
+        added
+    }
+
     /// Give small holes to the part around them: a connected area of pixels less than half
     /// covered, not touching the image border and at most `max_px` pixels, goes fully to the part
     /// that owns most of its rim. Background showing through the figure (between an arm and the
@@ -612,6 +758,50 @@ mod tests {
         assert_eq!(a.fill_enclosed_gaps(10), 2);
         assert_eq!((a.owner[2 * 8 + 2], a.owner[2 * 8 + 3]), (0, 0));
         assert_eq!(a.owner[0], NO_PART, "outside stays empty");
+    }
+
+    #[test]
+    fn a_refined_outline_extends_parts_to_their_nearest_neighbour_and_trims_the_rest() {
+        let mut a = grid(&["......", ".0011.", ".0011.", "......"]);
+        let w = 6;
+        // Refined outline: one pixel wider on the left and right, top row dropped.
+        let mut alpha = vec![0u8; 24];
+        for y in 1..3 {
+            for x in 0..6 {
+                alpha[y * w + x] = 200;
+            }
+        }
+        alpha[w + 3] = 0; // trimmed
+        assert_eq!(a.apply_outline(&alpha, 2), 4, "four new edge pixels");
+        assert_eq!((a.owner[w], a.owner[w + 5]), (0, 1), "each side goes to its nearest part");
+        assert_eq!(a.owner[w + 3], NO_PART, "dropped by the outline");
+        assert_eq!(a.coverage[w + 1], 200, "coverage follows the outline");
+        assert_eq!(a.outline()[w + 3], 0);
+        let mut far = grid(&["0...."]);
+        assert_eq!(far.apply_outline(&[255; 5], 2), 2, "reach limits how far a part extends");
+        assert_eq!(far.owner[4], NO_PART);
+        assert_eq!(far.apply_outline(&[1, 2], 2), 0, "mismatched sizes are ignored");
+    }
+
+    #[test]
+    fn stray_pieces_join_the_part_around_them_but_edge_pieces_stay() {
+        // A 2-px piece of part 0 fully inside part 1 moves to part 1.
+        let mut a = grid(
+            &["000000000000000000000000"; 6]
+                .iter()
+                .copied()
+                .chain(["000000000000111111111111", "000000000000110011111111", "000000000000111111111111"])
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(a.reassign_islands(10), 2);
+        assert_eq!((a.owner[24 * 7 + 14], a.owner[24 * 7 + 15]), (1, 1));
+        // A piece with open background on a quarter of its rim (toes between straps) stays.
+        let mut b = grid(&["0000000000000000"; 8].iter().copied().chain(["0000000000111...", "0000000000110...", "0000000000111..."]).collect::<Vec<_>>());
+        assert_eq!(b.reassign_islands(10), 0);
+        assert_eq!(b.owner[16 * 9 + 12], 0);
+        assert_eq!(a.reassign_islands(0), 0);
+        let mut bad = Assignment { width: 2, height: 2, owner: vec![0], coverage: vec![255] };
+        assert_eq!(bad.reassign_islands(10), 0);
     }
 
     #[test]
