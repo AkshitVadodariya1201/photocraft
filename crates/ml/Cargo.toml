@@ -1,0 +1,17 @@
+[package]
+name = "photocraft-ml"
+description = "Promptable segmentation (MobileSAM / SAM ONNX models) run in pure Rust through tract"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Pure-Rust ONNX inference (MIT OR Apache-2.0): no native runtime, no `unsafe` in this crate.
+tract-onnx = "=0.23.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
