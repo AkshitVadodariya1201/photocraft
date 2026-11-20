@@ -393,6 +393,8 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             }
             // Background prompts won their pixels from the parts: cut them out of the figure.
             let is_background: Vec<bool> = parts.iter().map(|p| p.background).collect();
+            let background_px: Vec<usize> =
+                assignment.owner.iter().enumerate().filter(|(_, o)| is_background.get(usize::from(**o)).copied().unwrap_or(false)).map(|(i, _)| i).collect();
             assignment.clear_parts(&is_background);
             // Sharpen the figure's outline against the photo (the same edge refinement as Select and
             // Mask); pixels it adds go to the nearest part, pixels it drops leave every part.
@@ -463,6 +465,14 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                 ctx.stage(0.95, 0.96, "Filling gaps", |_| assignment.solidify_interior(reach));
             }
 
+            // What background prompts won stays out: the outline refinement and gap filling above
+            // may have handed a narrow strip of wall back to the nearest part.
+            for &i in &background_px {
+                if let (Some(o), Some(c)) = (assignment.owner.get_mut(i), assignment.coverage.get_mut(i)) {
+                    *o = photocraft_ml::NO_PART;
+                    *c = 0;
+                }
+            }
             let source = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
             let LayerContent::Raster(pixels) = &source.content else { return Err(EngineError::Other("the layer is no longer a pixel layer".into())) };
             let pixels = pixels.clone();
