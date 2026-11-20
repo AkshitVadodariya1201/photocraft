@@ -861,6 +861,22 @@ impl Assignment {
         filled
     }
 
+    /// Clear the pixels won by background parts (`is_background[part]`): a strip of wall between
+    /// an arm and the body that a clothing part's mask spans is prompted as background, wins
+    /// those pixels in the competition and is then cut out of the figure. Returns the pixels
+    /// cleared.
+    pub fn clear_parts(&mut self, is_background: &[bool]) -> usize {
+        let mut cleared = 0usize;
+        for (o, c) in self.owner.iter_mut().zip(self.coverage.iter_mut()) {
+            if *o != NO_PART && is_background.get(usize::from(*o)).copied().unwrap_or(false) {
+                *o = NO_PART;
+                *c = 0;
+                cleared += 1;
+            }
+        }
+        cleared
+    }
+
     /// Give every pixel of a layer's pieces to the layer's first piece (`layer_of[part]`), so
     /// the clean-up after it works on whole layers: a stray bit of one kurta piece touching
     /// another kurta piece is still a stray bit of the kurta. Parts not in `layer_of` keep
@@ -1166,6 +1182,15 @@ mod tests {
         // Tiny pieces follow their own rule: use a limit that makes this piece not tiny.
         assert_eq!(a.reassign_islands(100), 9);
         assert!((22 * 40..25 * 40).all(|i| a.owner[i] != 2));
+    }
+
+    #[test]
+    fn background_parts_are_cut_out() {
+        let mut a = grid(&["0011", "0.11"]);
+        assert_eq!(a.clear_parts(&[false, true]), 4);
+        assert!(a.owner[2..4].iter().all(|o| *o == NO_PART) && a.coverage[2] == 0);
+        assert_eq!(a.owner[0], 0);
+        assert_eq!(a.clear_parts(&[]), 0);
     }
 
     #[test]

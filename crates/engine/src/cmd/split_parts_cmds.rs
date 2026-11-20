@@ -101,6 +101,37 @@ struct PartSpec {
     /// edge piece keeps its own sharp analysis instead of joining a nearby area into a large,
     /// coarser one.
     own_zoom: bool,
+    /// The layer's outline is crisp (`"hardEdge": true`): decided where the refined edge is,
+    /// then anti-aliased over about a pixel, instead of the refinement's soft matte. For
+    /// clothing and skin against a plain background, where a matte only adds a fuzzy rim;
+    /// hair keeps the matte.
+    hard_edge: bool,
+    /// Background, not a part (`"background": true`): it competes like a part, then the pixels
+    /// it wins are cut out of the figure and it makes no layer. For wall seen through a gap that
+    /// a clothing part's mask spans (between an arm and the body).
+    background: bool,
+}
+
+/// A crisp outline for a layer's 8-bit mask: covered where it is at least half covered, then
+/// anti-aliased with a 3 x 3 average (edges clamped).
+fn harden_mask(bytes: &[u8], w: usize, h: usize) -> Vec<u8> {
+    if bytes.len() != w * h || w == 0 || h == 0 {
+        return bytes.to_vec();
+    }
+    let solid: Vec<u16> = bytes.iter().map(|b| if *b >= 128 { 255 } else { 0 }).collect();
+    let mut out = vec![0u8; bytes.len()];
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = 0u16;
+            for (dx, dy) in [(-1i64, -1i64), (0, -1), (1, -1), (-1, 0), (0, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                let nx = (x as i64 + dx).clamp(0, w as i64 - 1) as usize;
+                let ny = (y as i64 + dy).clamp(0, h as i64 - 1) as usize;
+                sum += solid[ny * w + nx];
+            }
+            out[y * w + x] = ((sum + 4) / 9) as u8;
+        }
+    }
+    out
 }
 
 fn num(v: &Value, what: &str) -> Result<f32> {
@@ -176,11 +207,16 @@ fn parse_parts(p: &Value) -> Result<Vec<PartSpec>> {
         if !points.iter().any(|p| p.2) && rect.is_none() {
             return Err(bad(format!("parts[{i}] ({name}) needs an include point or a box")));
         }
-        let own_zoom = match part.get("ownZoom") {
-            None | Some(Value::Null) => false,
-            Some(v) => v.as_bool().ok_or_else(|| bad(format!("parts[{i}].ownZoom must be true or false")))?,
+        let flag = |key: &str| -> Result<bool> {
+            match part.get(key) {
+                None | Some(Value::Null) => Ok(false),
+                Some(v) => v.as_bool().ok_or_else(|| bad(format!("parts[{i}].{key} must be true or false"))),
+            }
         };
-        out.push(PartSpec { name, group, points, rect, own_zoom });
+        let own_zoom = flag("ownZoom")?;
+        let hard_edge = flag("hardEdge")?;
+        let background = flag("background")?;
+        out.push(PartSpec { name, group, points, rect, own_zoom, hard_edge, background });
     }
     Ok(out)
 }
@@ -355,6 +391,9 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             if ctx.cancelled() {
                 return Err(EngineError::Cancelled);
             }
+            // Background prompts won their pixels from the parts: cut them out of the figure.
+            let is_background: Vec<bool> = parts.iter().map(|p| p.background).collect();
+            assignment.clear_parts(&is_background);
             // Sharpen the figure's outline against the photo (the same edge refinement as Select and
             // Mask); pixels it adds go to the nearest part, pixels it drops leave every part.
             let mut edge_added = 0usize;
@@ -431,7 +470,7 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             // Parts that share a name (and group) are pieces of one layer: a drape and its border,
             // a kurta and its hem. The layer takes the first piece's place.
             let mut pieces: Vec<(&PartSpec, Vec<usize>)> = Vec::new();
-            for (i, part) in parts.iter().enumerate() {
+            for (i, part) in parts.iter().enumerate().filter(|(_, p)| !p.background) {
                 match pieces.iter_mut().find(|(p, _)| p.name == part.name && p.group == part.group) {
                     Some((_, list)) => list.push(i),
                     None => pieces.push((part, vec![i])),
@@ -441,7 +480,10 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             let mut groups: Vec<(Option<String>, Vec<Layer>)> = Vec::new();
             let mut made = Vec::new();
             for (part, list) in pieces {
-                let bytes = assignment.mask_of(&list);
+                let mut bytes = assignment.mask_of(&list);
+                if list.iter().any(|&i| parts.get(i).is_some_and(|p| p.hard_edge)) {
+                    bytes = harden_mask(&bytes, w as usize, h as usize);
+                }
                 if !bytes.iter().any(|b| *b > 0) {
                     made.push(json!({ "name": part.name, "layer": null, "pixels": 0 }));
                     continue;
@@ -497,7 +539,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: "Split into Parts",
         menu: &[],
         shortcut: None,
-        params: r##"{"layer":id?,"parts":[{"name":str,"group":str?,"points":[[x,y,1|0],…]?,"box":[x,y,w,h]?,"ownZoom":bool?},…] (document pixels; 1 include, 0 exclude; each part needs an include point or a box),"refineEdge":px? (outline refined against the photo over this band; default about 2.5× the analysis's enlargement, 0 = off),"refineBorders":px? (borders between two layers moved onto the photo's colour edge within this band; default refineEdge, 0 = off),"fillGaps":px? (largest enclosed unclaimed hole given to the part around it, and largest stray piece of a part moved to the part around it; default 0.03% of the image, 0 = off),"detail":bool=true (small boxed parts such as jewellery, straps and watches also get a zoomed analysis; overlapping areas merge unless a part sets ownZoom),"modelDir":str? (default PHOTOCRAFT_SAM_DIR: mobile_sam_image_encoder.onnx + sam_mask_decoder_single.onnx)} → {source, parts:[{name,group,layer,pixels}], gapsFilled, edgeAdded, islandsMoved, bordersMoved} (each part becomes a masked copy of the layer inside its group; parts with the same name and group are pieces of one layer; overlapping parts go to the strongest match; one undo step)"##,
+        params: r##"{"layer":id?,"parts":[{"name":str,"group":str?,"points":[[x,y,1|0],…]?,"box":[x,y,w,h]?,"ownZoom":bool?,"hardEdge":bool?,"background":bool?},…] (document pixels; 1 include, 0 exclude; each part needs an include point or a box),"refineEdge":px? (outline refined against the photo over this band; default about 2.5× the analysis's enlargement, 0 = off),"refineBorders":px? (borders between two layers moved onto the photo's colour edge within this band; default refineEdge, 0 = off),"fillGaps":px? (largest enclosed unclaimed hole given to the part around it, and largest stray piece of a part moved to the part around it; default 0.03% of the image, 0 = off),"detail":bool=true (small boxed parts such as jewellery, straps and watches also get a zoomed analysis; overlapping areas merge unless a part sets ownZoom; hardEdge gives a layer a crisp anti-aliased outline instead of a soft matte, for clothing and skin; a background part competes like a part, then what it wins is cut out and it makes no layer, for wall seen between an arm and the body),"modelDir":str? (default PHOTOCRAFT_SAM_DIR: mobile_sam_image_encoder.onnx + sam_mask_decoder_single.onnx)} → {source, parts:[{name,group,layer,pixels}], gapsFilled, edgeAdded, islandsMoved, bordersMoved} (each part becomes a masked copy of the layer inside its group; parts with the same name and group are pieces of one layer; overlapping parts go to the strongest match; one undo step)"##,
         enabled,
         run,
         journal: true,
@@ -547,7 +589,7 @@ mod tests {
     #[test]
     fn small_boxes_get_merged_zoom_areas_and_large_ones_none() {
         let area = photocraft_geom::Rect::new(0, 0, 3584, 4800);
-        let p = |name: &str, b: [f32; 4]| PartSpec { name: name.into(), group: None, points: vec![], rect: Some(b), own_zoom: false };
+        let p = |name: &str, b: [f32; 4]| PartSpec { name: name.into(), group: None, points: vec![], rect: Some(b), own_zoom: false, hard_edge: false, background: false };
         let parts = vec![
             p("Earring L", [1660.0, 790.0, 1710.0, 910.0]),
             p("Earring R", [1990.0, 710.0, 2050.0, 860.0]),
@@ -576,6 +618,23 @@ mod tests {
         let parsed = parse_parts(&json!({"parts": [{"name": "A", "box": [1, 1, 5, 5], "ownZoom": true}]}));
         assert!(parsed.is_ok_and(|v| v[0].own_zoom));
         assert!(parse_parts(&json!({"parts": [{"name": "A", "box": [1, 1, 5, 5], "ownZoom": 1}]})).is_err());
+    }
+
+    #[test]
+    fn hard_edges_are_crisp_and_anti_aliased() {
+        // A soft ramp across a vertical edge becomes solid / clear with one blended column.
+        let (w, h) = (8usize, 3usize);
+        let bytes: Vec<u8> = (0..w * h).map(|i| [0u8, 20, 60, 110, 150, 200, 240, 255][i % w]).collect();
+        let hard = harden_mask(&bytes, w, h);
+        let row = &hard[w..2 * w];
+        assert_eq!((row[0], row[1], row[2], row[5], row[6], row[7]), (0, 0, 0, 255, 255, 255));
+        assert!(row[3] > 0 && row[3] < 255 && row[4] > 0 && row[4] < 255, "{row:?}");
+        assert_eq!(harden_mask(&bytes[1..], w, h), bytes[1..].to_vec());
+        let parsed = parse_parts(&json!({"parts": [{"name": "A", "points": [[1, 1]], "hardEdge": true}]}));
+        assert!(parsed.is_ok_and(|v| v[0].hard_edge));
+        assert!(parse_parts(&json!({"parts": [{"name": "A", "points": [[1, 1]], "hardEdge": "yes"}]})).is_err());
+        let bg = parse_parts(&json!({"parts": [{"name": "Wall", "points": [[1, 1]], "background": true}]}));
+        assert!(bg.is_ok_and(|v| v[0].background));
     }
 
     #[test]
