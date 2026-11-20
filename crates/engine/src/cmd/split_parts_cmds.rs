@@ -394,12 +394,10 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             // moved onto the photo's own colour edge.
             let mut borders_moved = 0usize;
             let radius = refine_borders.round() as usize;
+            // Each part's layer, as the index of the layer's first piece.
+            let layer_of: Vec<usize> =
+                parts.iter().enumerate().map(|(i, part)| parts.iter().position(|q| q.name == part.name && q.group == part.group).unwrap_or(i)).collect();
             if radius > 0 {
-                let mut layer_of: Vec<usize> = Vec::with_capacity(parts.len());
-                for (i, part) in parts.iter().enumerate() {
-                    let first = parts.iter().position(|q| q.name == part.name && q.group == part.group).unwrap_or(i);
-                    layer_of.push(first);
-                }
                 let rgb: Vec<[u8; 3]> = with_doc_sampler(doc, Some(id), false, |smp, _| smp.rgb_scaled(area, 1))
                     .px
                     .iter()
@@ -415,8 +413,16 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
                     return Err(EngineError::Cancelled);
                 }
             }
+            // From here on the clean-up works on whole layers, not on the pieces they were made of.
+            assignment.merge_parts(&layer_of);
             let islands_moved = ctx.stage(0.91, 0.93, "Cleaning stray pieces", |_| assignment.reassign_islands(fill_gaps));
             let filled = ctx.stage(0.93, 0.95, "Filling gaps", |_| assignment.fill_enclosed_gaps(fill_gaps));
+            // Inside the figure nothing is behind the parts: unsure (soft) coverage there becomes
+            // opaque, while the outline's own soft band (refinement reach) keeps its matte.
+            if refine_edge > 0.0 {
+                let reach = (refine_edge * 2.0).ceil() as usize + 2;
+                ctx.stage(0.95, 0.96, "Filling gaps", |_| assignment.solidify_interior(reach));
+            }
 
             let source = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
             let LayerContent::Raster(pixels) = &source.content else { return Err(EngineError::Other("the layer is no longer a pixel layer".into())) };

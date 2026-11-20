@@ -860,6 +860,63 @@ impl Assignment {
         }
         filled
     }
+
+    /// Give every pixel of a layer's pieces to the layer's first piece (`layer_of[part]`), so
+    /// the clean-up after it works on whole layers: a stray bit of one kurta piece touching
+    /// another kurta piece is still a stray bit of the kurta. Parts not in `layer_of` keep
+    /// their pixels.
+    pub fn merge_parts(&mut self, layer_of: &[usize]) {
+        for o in &mut self.owner {
+            if let Some(first) = layer_of.get(usize::from(*o)).and_then(|f| u16::try_from(*f).ok()) {
+                *o = first;
+            }
+        }
+    }
+
+    /// Make the inside of the figure opaque: every covered pixel farther than `reach` pixels
+    /// from the background (what is still uncovered after [`Self::fill_enclosed_gaps`]: outside
+    /// the figure and large holes such as a garden seen between arm and body) gets full
+    /// coverage. Soft coverage there comes from parts that were unsure (dark shadow between a
+    /// hand and the fabric) and would let a layer below show through where nothing is behind
+    /// it in the photo; soft edges against the background keep their matte. Returns the pixels
+    /// made opaque.
+    pub fn solidify_interior(&mut self, reach: usize) -> usize {
+        let (w, h) = (self.width, self.height);
+        let n = w.saturating_mul(h);
+        if n == 0 || self.owner.len() != n || self.coverage.len() != n {
+            return 0;
+        }
+        let reach = reach.min(u16::MAX as usize - 1);
+        let mut dist = vec![u16::MAX; n];
+        let mut queue = std::collections::VecDeque::new();
+        for i in 0..n {
+            if self.owner[i] == NO_PART || self.coverage[i] < 128 {
+                dist[i] = 0;
+                queue.push_back(i);
+            }
+        }
+        while let Some(i) = queue.pop_front() {
+            let d = dist[i];
+            if usize::from(d) >= reach {
+                continue;
+            }
+            let (x, y) = (i % w, i / w);
+            for j in [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)].into_iter().flatten() {
+                if dist[j] == u16::MAX {
+                    dist[j] = d + 1;
+                    queue.push_back(j);
+                }
+            }
+        }
+        let mut made = 0usize;
+        for i in 0..n {
+            if dist[i] == u16::MAX && self.owner[i] != NO_PART && self.coverage[i] < 255 {
+                self.coverage[i] = 255;
+                made += 1;
+            }
+        }
+        made
+    }
 }
 
 #[cfg(test)]
@@ -1109,6 +1166,40 @@ mod tests {
         // Tiny pieces follow their own rule: use a limit that makes this piece not tiny.
         assert_eq!(a.reassign_islands(100), 9);
         assert!((22 * 40..25 * 40).all(|i| a.owner[i] != 2));
+    }
+
+    #[test]
+    fn pieces_of_one_layer_merge_before_clean_up() {
+        // Part 1 is a second piece of part 0's layer; its stray bit inside part 2 now belongs to
+        // part 0 and so is a stray piece of that layer.
+        let mut a = grid(&["0000000000", "0000000000", "2222222222", "2221222222", "2222222222"]);
+        a.merge_parts(&[0, 0, 2]);
+        assert_eq!(a.owner[3 * 10 + 3], 0);
+        assert_eq!(a.owner[2 * 10], 2);
+        let mut b = grid(&["01"]);
+        b.merge_parts(&[]);
+        assert_eq!(b.owner, vec![0, 1]);
+    }
+
+    #[test]
+    fn soft_pixels_inside_the_figure_become_opaque_but_edges_stay_soft() {
+        let (w, h) = (30usize, 30usize);
+        let mut a = Assignment { width: w, height: h, owner: vec![NO_PART; w * h], coverage: vec![0; w * h] };
+        for y in 5..25 {
+            for x in 5..25 {
+                a.owner[y * w + x] = 0;
+                a.coverage[y * w + x] = 255;
+            }
+        }
+        // A soft edge pixel next to the background and a soft spot deep inside.
+        a.coverage[5 * w + 10] = 180;
+        a.coverage[15 * w + 15] = 160;
+        assert_eq!(a.solidify_interior(3), 1);
+        assert_eq!(a.coverage[15 * w + 15], 255);
+        assert_eq!(a.coverage[5 * w + 10], 180);
+        assert_eq!(a.owner[0], NO_PART);
+        let mut bad = Assignment { width: 2, height: 2, owner: vec![0], coverage: vec![1] };
+        assert_eq!(bad.solidify_interior(3), 0);
     }
 
     #[test]
