@@ -253,6 +253,15 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             n.min(MAX_REFINE_EDGE)
         }
     };
+    // Borders between parts are drawn on the same coarse grid: snap them to the photo over the
+    // same band by default.
+    let refine_borders = match p.get("refineBorders") {
+        None | Some(Value::Null) => refine_edge,
+        Some(v) => {
+            let n = v.as_f64().filter(|n| n.is_finite() && *n >= 0.0).ok_or_else(|| bad("refineBorders must be a number of pixels, 0 or more"))?;
+            n.min(MAX_REFINE_EDGE)
+        }
+    };
     let fill_gaps = match p.get("fillGaps") {
         None | Some(Value::Null) => (pixels_total as f64 * FILL_GAPS_SHARE) as usize,
         Some(v) => {
@@ -381,7 +390,32 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             }
             // Stray pieces of a part inside another (a speck of kurta in the dupatta) join the
             // part around them; then small holes are filled. Both use the fillGaps size limit.
-            let islands_moved = ctx.stage(0.9, 0.93, "Cleaning stray pieces", |_| assignment.reassign_islands(fill_gaps));
+            // Borders between two layers (a dupatta's edge on the kurta, a hand on the fabric) are
+            // moved onto the photo's own colour edge.
+            let mut borders_moved = 0usize;
+            let radius = refine_borders.round() as usize;
+            if radius > 0 {
+                let mut layer_of: Vec<usize> = Vec::with_capacity(parts.len());
+                for (i, part) in parts.iter().enumerate() {
+                    let first = parts.iter().position(|q| q.name == part.name && q.group == part.group).unwrap_or(i);
+                    layer_of.push(first);
+                }
+                let rgb: Vec<[u8; 3]> = with_doc_sampler(doc, Some(id), false, |smp, _| smp.rgb_scaled(area, 1))
+                    .px
+                    .iter()
+                    .map(|c| c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8))
+                    .collect();
+                // Layers made only of small boxed items (jewellery, sandals) were analysed zoomed
+                // already; a chain's few pixels would lose a colour vote against the skin.
+                let long = area.width().max(area.height()) as f32;
+                let small = |q: &PartSpec| q.rect.is_some_and(|[x0, y0, x1, y1]| (x1 - x0).max(y1 - y0) <= DETAIL_SHARE * long);
+                let locked: Vec<bool> = layer_of.iter().map(|&first| parts.iter().enumerate().filter(|(j, _)| layer_of[*j] == first).all(|(_, q)| small(q))).collect();
+                borders_moved = ctx.stage(0.9, 0.91, "Refining borders", |_| assignment.refine_borders(&rgb, &layer_of, &locked, radius));
+                if ctx.cancelled() {
+                    return Err(EngineError::Cancelled);
+                }
+            }
+            let islands_moved = ctx.stage(0.91, 0.93, "Cleaning stray pieces", |_| assignment.reassign_islands(fill_gaps));
             let filled = ctx.stage(0.93, 0.95, "Filling gaps", |_| assignment.fill_enclosed_gaps(fill_gaps));
 
             let source = doc.layer(id).ok_or(EngineError::NoLayer(id))?;
@@ -442,9 +476,11 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
             }
             doc.selection = None;
             *active = Some(top);
-            Ok((made, filled, edge_added, islands_moved))
+            Ok((made, filled, edge_added, islands_moved, borders_moved))
         },
-        move |(made, filled, edge_added, islands_moved)| json!({ "source": id.0, "parts": made, "gapsFilled": filled, "edgeAdded": edge_added, "islandsMoved": islands_moved }),
+        move |(made, filled, edge_added, islands_moved, borders_moved)| {
+            json!({ "source": id.0, "parts": made, "gapsFilled": filled, "edgeAdded": edge_added, "islandsMoved": islands_moved, "bordersMoved": borders_moved })
+        },
     )
 }
 
@@ -455,7 +491,7 @@ pub fn specs() -> Vec<CommandSpec> {
         label: "Split into Parts",
         menu: &[],
         shortcut: None,
-        params: r##"{"layer":id?,"parts":[{"name":str,"group":str?,"points":[[x,y,1|0],…]?,"box":[x,y,w,h]?,"ownZoom":bool?},…] (document pixels; 1 include, 0 exclude; each part needs an include point or a box),"refineEdge":px? (outline refined against the photo over this band; default about 2.5× the analysis's enlargement, 0 = off),"fillGaps":px? (largest enclosed unclaimed hole given to the part around it, and largest stray piece of a part moved to the part around it; default 0.03% of the image, 0 = off),"detail":bool=true (small boxed parts such as jewellery, straps and watches also get a zoomed analysis; overlapping areas merge unless a part sets ownZoom),"modelDir":str? (default PHOTOCRAFT_SAM_DIR: mobile_sam_image_encoder.onnx + sam_mask_decoder_single.onnx)} → {source, parts:[{name,group,layer,pixels}], gapsFilled, edgeAdded, islandsMoved} (each part becomes a masked copy of the layer inside its group; parts with the same name and group are pieces of one layer; overlapping parts go to the strongest match; one undo step)"##,
+        params: r##"{"layer":id?,"parts":[{"name":str,"group":str?,"points":[[x,y,1|0],…]?,"box":[x,y,w,h]?,"ownZoom":bool?},…] (document pixels; 1 include, 0 exclude; each part needs an include point or a box),"refineEdge":px? (outline refined against the photo over this band; default about 2.5× the analysis's enlargement, 0 = off),"refineBorders":px? (borders between two layers moved onto the photo's colour edge within this band; default refineEdge, 0 = off),"fillGaps":px? (largest enclosed unclaimed hole given to the part around it, and largest stray piece of a part moved to the part around it; default 0.03% of the image, 0 = off),"detail":bool=true (small boxed parts such as jewellery, straps and watches also get a zoomed analysis; overlapping areas merge unless a part sets ownZoom),"modelDir":str? (default PHOTOCRAFT_SAM_DIR: mobile_sam_image_encoder.onnx + sam_mask_decoder_single.onnx)} → {source, parts:[{name,group,layer,pixels}], gapsFilled, edgeAdded, islandsMoved, bordersMoved} (each part becomes a masked copy of the layer inside its group; parts with the same name and group are pieces of one layer; overlapping parts go to the strongest match; one undo step)"##,
         enabled,
         run,
         journal: true,
@@ -551,6 +587,8 @@ mod tests {
         for bad in [json!("x"), json!(-1), json!({})] {
             let r = s.execute(CMD, json!({"parts": [{"name": "A", "points": [[10, 10]]}], "refineEdge": bad}));
             assert!(r.is_err(), "refineEdge {bad} should be rejected");
+            let r = s.execute(CMD, json!({"parts": [{"name": "A", "points": [[10, 10]]}], "refineBorders": bad}));
+            assert!(r.is_err(), "refineBorders {bad} should be rejected");
         }
     }
 

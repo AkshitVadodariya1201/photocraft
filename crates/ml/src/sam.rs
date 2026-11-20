@@ -581,6 +581,208 @@ impl Assignment {
         added
     }
 
+    /// Snap the borders between layers to the photo: every covered pixel within `radius` of a
+    /// border between two different layers (`layer_of[part]`; pieces of one layer have no border
+    /// between them) is given again to the layer whose nearby pixels look most like it (a
+    /// colour-weighted vote of the pixels around it, trusting those far from the border more,
+    /// twice over). The whole-image analysis
+    /// draws such borders on a coarse grid, so a dupatta's edge on a kurta comes out
+    /// stair-stepped and frayed; the photo's own colour edge is where it really is. Thin items
+    /// of a distinct colour (a chain on skin) keep their pixels, as those vote for each other.
+    /// The outline against the background is left alone, and so are parts marked in `locked`
+    /// (small items that already had their own zoomed analysis): their pixels neither move nor
+    /// vote. `rgb` holds the photo's pixels for this area. Returns the pixels that changed layer.
+    pub fn refine_borders(&mut self, rgb: &[[u8; 3]], layer_of: &[usize], locked: &[bool], radius: usize) -> usize {
+        let (w, h) = (self.width, self.height);
+        let n = w.saturating_mul(h);
+        if radius == 0 || n == 0 || rgb.len() != n || self.owner.len() != n || self.coverage.len() != n {
+            return 0;
+        }
+        let radius = radius.min(64);
+        let coverage = &self.coverage;
+        let layer = |o: u16| -> Option<usize> {
+            if o == NO_PART || locked.get(usize::from(o)).copied().unwrap_or(false) {
+                None
+            } else {
+                Some(layer_of.get(usize::from(o)).copied().unwrap_or(usize::from(o) + 1_000_000))
+            }
+        };
+        let solid_layer = |owner: &[u16], i: usize| -> Option<usize> { if coverage[i] >= 128 { layer(owner[i]) } else { None } };
+        // The band: distance (8-connected steps) from a pixel on a border between two layers.
+        let mut dist = vec![u8::MAX; n];
+        let mut queue = std::collections::VecDeque::new();
+        for i in 0..n {
+            let Some(l) = solid_layer(&self.owner, i) else { continue };
+            let (x, y) = (i % w, i / w);
+            let next = [(x + 1 < w).then(|| i + 1), (y + 1 < h).then(|| i + w)];
+            for j in next.into_iter().flatten() {
+                if solid_layer(&self.owner, j).is_some_and(|m| m != l) {
+                    for k in [i, j] {
+                        if dist[k] != 0 {
+                            dist[k] = 0;
+                            queue.push_back(k);
+                        }
+                    }
+                }
+            }
+        }
+        while let Some(i) = queue.pop_front() {
+            let d = dist[i];
+            if usize::from(d) >= radius {
+                continue;
+            }
+            let (x, y) = (i % w, i / w);
+            for (dx, dy) in [(-1i64, -1i64), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)] {
+                let (nx, ny) = (x as i64 + dx, y as i64 + dy);
+                if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                    continue;
+                }
+                let j = ny as usize * w + nx as usize;
+                if dist[j] == u8::MAX {
+                    dist[j] = d + 1;
+                    queue.push_back(j);
+                }
+            }
+        }
+        let band: Vec<usize> = (0..n).filter(|&i| dist[i] != u8::MAX && solid_layer(&self.owner, i).is_some()).collect();
+        // Pixels far from the border are sure of their layer; those near it vote less, so a
+        // sliver on the wrong side of the drawn border cannot outvote the photo.
+        let trust: Vec<f32> = dist.iter().map(|d| if *d == u8::MAX { 1.0 } else { (f32::from(*d) + 1.0) / (radius as f32 + 1.0) }).collect();
+        drop(dist);
+        if band.is_empty() {
+            return 0;
+        }
+        // Sample a window twice the band's width on a grid (about 13 x 13 samples), weighted by
+        // distance, colour and trust.
+        let r = 2 * radius as i64;
+        let stride = (r / 6).max(1) as usize;
+        let sigma_s = (radius as f32).max(1.0);
+        let offsets: Vec<(i64, i64, f32)> = (-r..=r)
+            .step_by(stride)
+            .flat_map(|dy| (-r..=r).step_by(stride).map(move |dx| (dx, dy)))
+            .filter(|&(dx, dy)| dx * dx + dy * dy <= r * r && (dx, dy) != (0, 0))
+            .map(|(dx, dy)| (dx, dy, (-((dx * dx + dy * dy) as f32) / (2.0 * sigma_s * sigma_s)).exp()))
+            .collect();
+        const SIGMA_C: f32 = 16.0;
+        let colour_w: Vec<f32> = (0..=3 * 255 * 255).map(|d2| (-(d2 as f32) / (2.0 * SIGMA_C * SIGMA_C)).exp()).collect();
+        let mut changed = 0usize;
+        // Whether the colours clearly chose a pixel's layer (then smoothing leaves it alone).
+        let mut sure: Vec<bool> = Vec::new();
+        for _ in 0..2 {
+            let owner = &self.owner;
+            let vote = |&i: &usize| -> (u16, bool) {
+                let (x, y) = ((i % w) as i64, (i / w) as i64);
+                let c = rgb[i];
+                // Per layer: total weight, and the part of its strongest sample (keeps pieces local).
+                let mut tally: Vec<(usize, f32, u16, f32)> = Vec::with_capacity(4);
+                for &(dx, dy, ws) in &offsets {
+                    let (nx, ny) = (x + dx, y + dy);
+                    if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                        continue;
+                    }
+                    let j = ny as usize * w + nx as usize;
+                    let Some(l) = solid_layer(owner, j) else { continue };
+                    let q = rgb[j];
+                    let d2: usize = (0..3)
+                        .map(|k| {
+                            let d = i32::from(c[k]) - i32::from(q[k]);
+                            (d * d) as usize
+                        })
+                        .sum();
+                    let wt = ws * trust[j] * colour_w.get(d2).copied().unwrap_or(0.0);
+                    match tally.iter_mut().find(|t| t.0 == l) {
+                        Some(t) => {
+                            t.1 += wt;
+                            if wt > t.3 {
+                                t.2 = owner[j];
+                                t.3 = wt;
+                            }
+                        }
+                        None => tally.push((l, wt, owner[j], wt)),
+                    }
+                }
+                let mine = solid_layer(owner, i);
+                let Some(best) = tally.iter().max_by(|a, b| a.1.total_cmp(&b.1)) else { return (owner[i], true) };
+                let total: f32 = tally.iter().map(|t| t.1).sum();
+                let sure = best.1 >= 0.75 * total;
+                if Some(best.0) == mine || best.1 <= 0.0 { (owner[i], sure) } else { (best.2, sure) }
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let next: Vec<(u16, bool)> = {
+                use rayon::prelude::*;
+                band.par_iter().map(vote).collect()
+            };
+            #[cfg(target_arch = "wasm32")]
+            let next: Vec<(u16, bool)> = band.iter().map(vote).collect();
+            sure = next.iter().map(|v| v.1).collect();
+            let mut moved = 0usize;
+            for (&i, (o, _)) in band.iter().zip(next) {
+                if self.owner[i] != o {
+                    if layer(self.owner[i]) != layer(o) {
+                        moved += 1;
+                    }
+                    self.owner[i] = o;
+                }
+            }
+            changed += moved;
+            if moved == 0 {
+                break;
+            }
+        }
+        // Straighten the border: twice, each band pixel whose colours did not clearly choose takes
+        // the layer most of its neighbours have (a window of about a third of the band) when they
+        // are a clear majority, so teeth left by a printed motif in the border's own colour are
+        // cut off while a thin strand of its own colour stays.
+        let s = (radius / 3).max(1) as i64;
+        for _ in 0..2 {
+            let owner = &self.owner;
+            let smooth = |(&i, &sure): (&usize, &bool)| -> u16 {
+                if sure {
+                    return owner[i];
+                }
+                let (x, y) = ((i % w) as i64, (i / w) as i64);
+                let mut tally: Vec<(usize, u32, u16)> = Vec::with_capacity(4);
+                let mut total = 0u32;
+                for dy in -s..=s {
+                    for dx in -s..=s {
+                        let (nx, ny) = (x + dx, y + dy);
+                        if nx < 0 || ny < 0 || nx >= w as i64 || ny >= h as i64 {
+                            continue;
+                        }
+                        let j = ny as usize * w + nx as usize;
+                        let Some(l) = solid_layer(owner, j) else { continue };
+                        total += 1;
+                        match tally.iter_mut().find(|t| t.0 == l) {
+                            Some(t) => t.1 += 1,
+                            None => tally.push((l, 1, owner[j])),
+                        }
+                    }
+                }
+                let mine = solid_layer(owner, i);
+                match tally.iter().max_by_key(|t| t.1) {
+                    Some(best) if Some(best.0) != mine && best.1 * 3 > total * 2 => best.2,
+                    _ => owner[i],
+                }
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let next: Vec<u16> = {
+                use rayon::prelude::*;
+                band.par_iter().zip(sure.par_iter()).map(smooth).collect()
+            };
+            #[cfg(target_arch = "wasm32")]
+            let next: Vec<u16> = band.iter().zip(sure.iter()).map(smooth).collect();
+            for (&i, o) in band.iter().zip(next) {
+                if self.owner[i] != o {
+                    if layer(self.owner[i]) != layer(o) {
+                        changed += 1;
+                    }
+                    self.owner[i] = o;
+                }
+            }
+        }
+        changed
+    }
+
     /// Fill small holes from the parts around them: a connected area of pixels less than half
     /// covered, not touching the image border and at most `max_px` pixels, is shared out by
     /// nearest part (breadth first from its rim), so a sliver between fingertips and fabric
@@ -843,6 +1045,50 @@ mod tests {
         let mut a = grid(&rows);
         assert_eq!(a.reassign_islands(16), 1);
         assert_eq!(a.owner[16 * 7 + 7], 0);
+    }
+
+    #[test]
+    fn borders_snap_to_the_colour_edge_and_thin_items_stay() {
+        // Two layers whose drawn border (x = 10) is 3 px left of the colour edge (x = 13).
+        let (w, h) = (24usize, 12usize);
+        let mut a = Assignment { width: w, height: h, owner: vec![0; w * h], coverage: vec![255; w * h] };
+        let mut rgb = vec![[200u8, 180, 160]; w * h];
+        for y in 0..h {
+            for x in 0..w {
+                if x >= 10 {
+                    a.owner[y * w + x] = 1;
+                }
+                if x >= 13 {
+                    rgb[y * w + x] = [110, 30, 40];
+                }
+            }
+        }
+        // A 1-px dark chain (part 2) running down inside part 0, on its own colour.
+        for y in 0..h {
+            a.owner[y * w + 4] = 2;
+            rgb[y * w + 4] = [60, 60, 60];
+        }
+        let changed = a.refine_borders(&rgb, &[0, 1, 2], &[], 4);
+        assert_eq!(changed, 3 * h);
+        for y in 0..h {
+            assert_eq!(&a.owner[y * w + 9..y * w + 14], &[0, 0, 0, 0, 1], "row {y}");
+            assert_eq!(a.owner[y * w + 4], 2, "chain kept");
+        }
+        // Pieces of one layer have no border between them; bad sizes and radius 0 do nothing.
+        let mut same = Assignment { width: w, height: h, owner: (0..w * h).map(|i| u16::from(i % w >= 10)).collect(), coverage: vec![255; w * h] };
+        assert_eq!(same.refine_borders(&rgb, &[0, 0], &[], 4), 0);
+        assert_eq!(same.refine_borders(&rgb, &[0, 1], &[], 0), 0);
+        assert_eq!(same.refine_borders(&rgb[1..], &[0, 1], &[], 4), 0);
+        // A tooth of layer 1 sticking 2 px into layer 0 on the same colour as layer 0 is cut off.
+        let mut tooth = Assignment { width: w, height: h, owner: (0..w * h).map(|i| u16::from(i % w >= 13)).collect(), coverage: vec![255; w * h] };
+        tooth.owner[6 * w + 11] = 1;
+        tooth.owner[6 * w + 12] = 1;
+        tooth.refine_borders(&rgb, &[0, 1, 2], &[], 4);
+        assert_eq!((tooth.owner[6 * w + 11], tooth.owner[6 * w + 12]), (0, 0));
+        // A locked part keeps its pixels even where the colours say otherwise.
+        let mut kept = Assignment { width: w, height: h, owner: (0..w * h).map(|i| u16::from(i % w >= 10)).collect(), coverage: vec![255; w * h] };
+        assert_eq!(kept.refine_borders(&rgb, &[0, 1], &[false, true], 4), 0);
+        assert!((0..h).all(|y| kept.owner[y * w + 10] == 1));
     }
 
     #[test]
