@@ -515,8 +515,14 @@ impl Assignment {
                 }
             }
             let total: u32 = rim.iter().sum();
+            let covered: u32 = rim.iter().take(65).sum();
             let Some((best, count)) = rim.iter().enumerate().take(65).filter(|(p, _)| *p != usize::from(o)).max_by_key(|(_, c)| **c) else { continue };
-            if total == 0 || (*count as f64) < 0.8 * total as f64 {
+            // Tiny specks (a 16th of the limit) may sit where several parts meet: they follow the
+            // neighbour touching them most unless open background is half their rim. Larger pieces
+            // need one part on 80 % of the whole rim (toes between sandal straps stay skin).
+            let tiny = size.saturating_mul(16) <= max_px;
+            let moves = if tiny { *count > 0 && covered * 2 >= total } else { total > 0 && (*count as f64) >= 0.8 * total as f64 };
+            if !moves {
                 continue;
             }
             let Ok(best) = u16::try_from(best) else { continue };
@@ -575,9 +581,10 @@ impl Assignment {
         added
     }
 
-    /// Give small holes to the part around them: a connected area of pixels less than half
-    /// covered, not touching the image border and at most `max_px` pixels, goes fully to the part
-    /// that owns most of its rim. Background showing through the figure (between an arm and the
+    /// Fill small holes from the parts around them: a connected area of pixels less than half
+    /// covered, not touching the image border and at most `max_px` pixels, is shared out by
+    /// nearest part (breadth first from its rim), so a sliver between fingertips and fabric
+    /// splits down the middle instead of going all to one side. Background showing through the figure (between an arm and the
     /// body) is usually larger than `max_px` and stays empty. Returns the pixels filled.
     pub fn fill_enclosed_gaps(&mut self, max_px: usize) -> usize {
         let (w, h) = (self.width, self.height);
@@ -619,17 +626,30 @@ impl Assignment {
                     }
                 }
             }
-            if touches_border || comp.len() > max_px {
+            if touches_border || comp.len() > max_px || rim.iter().all(|c| *c == 0) {
                 continue;
             }
-            let Some((best, count)) = rim.iter().enumerate().take(64).max_by_key(|(_, c)| **c) else { continue };
-            if *count == 0 {
-                continue;
-            }
-            let Ok(best) = u16::try_from(best) else { continue };
+            // Breadth first from the rim's owned pixels into this hole only.
+            let mut queue = std::collections::VecDeque::new();
+            let in_hole: std::collections::HashSet<usize> = comp.iter().copied().collect();
             for &i in &comp {
-                self.owner[i] = best;
-                self.coverage[i] = 255;
+                let (x, y) = (i % w, i / w);
+                for j in [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)].into_iter().flatten() {
+                    if !in_hole.contains(&j) && self.owner[j] != NO_PART {
+                        queue.push_back(j);
+                    }
+                }
+            }
+            let mut done: std::collections::HashSet<usize> = std::collections::HashSet::new();
+            while let Some(i) = queue.pop_front() {
+                let (x, y) = (i % w, i / w);
+                for j in [(x > 0).then(|| i - 1), (x + 1 < w).then(|| i + 1), (y > 0).then(|| i - w), (y + 1 < h).then(|| i + w)].into_iter().flatten() {
+                    if in_hole.contains(&j) && done.insert(j) {
+                        self.owner[j] = self.owner[i];
+                        self.coverage[j] = 255;
+                        queue.push_back(j);
+                    }
+                }
             }
             filled += comp.len();
         }
@@ -754,9 +774,11 @@ mod tests {
     #[test]
     fn small_enclosed_gaps_go_to_the_part_around_them() {
         let mut a = grid(&["........", ".000111.", ".0..111.", ".000111.", "........"]);
-        // The 2-px hole is enclosed (mostly by part 0); the outside touches the border.
+        // The 2-px hole is enclosed; the outside touches the border. Each hole pixel takes a
+        // part next to it (the right one is as near to part 1 as to part 0).
         assert_eq!(a.fill_enclosed_gaps(10), 2);
-        assert_eq!((a.owner[2 * 8 + 2], a.owner[2 * 8 + 3]), (0, 0));
+        assert_eq!(a.owner[2 * 8 + 2], 0);
+        assert!(matches!(a.owner[2 * 8 + 3], 0 | 1));
         assert_eq!(a.owner[0], NO_PART, "outside stays empty");
     }
 
@@ -802,6 +824,25 @@ mod tests {
         assert_eq!(a.reassign_islands(0), 0);
         let mut bad = Assignment { width: 2, height: 2, owner: vec![0], coverage: vec![255] };
         assert_eq!(bad.reassign_islands(10), 0);
+    }
+
+    #[test]
+    fn a_hole_between_two_parts_is_split_by_nearest_part() {
+        // A 1x4 hole between part 0 (left) and part 1 (right) splits 2 / 2.
+        let mut a = grid(&["000000011111", "00000....111", "000000011111"]);
+        assert_eq!(a.fill_enclosed_gaps(10), 4);
+        let row = 12;
+        assert_eq!(&a.owner[row + 5..row + 9], &[0, 0, 1, 1]);
+    }
+
+    #[test]
+    fn a_tiny_speck_where_two_parts_meet_follows_the_larger_neighbour() {
+        // A 1-px piece of part 2 touching part 0 on three sides and part 1 on one.
+        let mut rows = vec!["2222222222222222"; 6];
+        rows.extend(["0000000011111111", "0000000201111111", "0000000011111111"]);
+        let mut a = grid(&rows);
+        assert_eq!(a.reassign_islands(16), 1);
+        assert_eq!(a.owner[16 * 7 + 7], 0);
     }
 
     #[test]
