@@ -519,9 +519,12 @@ impl Assignment {
             let Some((best, count)) = rim.iter().enumerate().take(65).filter(|(p, _)| *p != usize::from(o)).max_by_key(|(_, c)| **c) else { continue };
             // Tiny specks (a 16th of the limit) may sit where several parts meet: they follow the
             // neighbour touching them most unless open background is half their rim. Larger pieces
-            // need one part on 80 % of the whole rim (toes between sandal straps stay skin).
+            // need one part on 80 % of the whole rim (toes between sandal straps stay skin), or to
+            // be enclosed by other parts (at most 5 % of the rim open) and then go to the one they
+            // touch most (shadow under fingertips where the fabric's edge meets the kurta).
             let tiny = size.saturating_mul(16) <= max_px;
-            let moves = if tiny { *count > 0 && covered * 2 >= total } else { total > 0 && (*count as f64) >= 0.8 * total as f64 };
+            let enclosed = *count > 0 && (total - covered) * 20 <= total;
+            let moves = if tiny { *count > 0 && covered * 2 >= total } else { enclosed || (total > 0 && (*count as f64) >= 0.8 * total as f64) };
             if !moves {
                 continue;
             }
@@ -1089,6 +1092,23 @@ mod tests {
         let mut kept = Assignment { width: w, height: h, owner: (0..w * h).map(|i| u16::from(i % w >= 10)).collect(), coverage: vec![255; w * h] };
         assert_eq!(kept.refine_borders(&rgb, &[0, 1], &[false, true], 4), 0);
         assert!((0..h).all(|y| kept.owner[y * w + 10] == 1));
+    }
+
+    #[test]
+    fn an_enclosed_stray_piece_goes_to_the_part_it_touches_most() {
+        // A 3x3 piece of part 2 between part 0 and part 1 with no background around it; part 2's
+        // main area is the large block on top.
+        let mut rows: Vec<String> = vec!["2".repeat(40); 20];
+        rows.push(format!("{}{}", "0".repeat(20), "1".repeat(20)));
+        for _ in 0..3 {
+            rows.push(format!("{}222{}", "0".repeat(19), "1".repeat(18)));
+        }
+        rows.push(format!("{}{}", "0".repeat(20), "1".repeat(20)));
+        let refs: Vec<&str> = rows.iter().map(String::as_str).collect();
+        let mut a = grid(&refs);
+        // Tiny pieces follow their own rule: use a limit that makes this piece not tiny.
+        assert_eq!(a.reassign_islands(100), 9);
+        assert!((22 * 40..25 * 40).all(|i| a.owner[i] != 2));
     }
 
     #[test]

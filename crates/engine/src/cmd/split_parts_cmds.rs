@@ -28,7 +28,7 @@ const MAX_NAME: usize = 120;
 /// analysis: thin straps, chains and jewellery are below the whole-image analysis's resolution.
 const DETAIL_SHARE: f32 = 0.35;
 /// Most zoomed analyses per split (each costs about as much as the whole-image one).
-const MAX_DETAIL_AREAS: usize = 8;
+const MAX_DETAIL_AREAS: usize = 12;
 /// Smallest side of a zoomed area, in document pixels.
 const MIN_DETAIL_SIDE: f32 = 256.0;
 /// Default largest hole filled, as a share of the image's pixels (0.03 %: about 5,200 px on a
