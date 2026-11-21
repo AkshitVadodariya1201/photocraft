@@ -294,12 +294,18 @@ pub struct PartMap {
     parts: Vec<Vec<(Logits, Detail)>>,
 }
 
+/// How far above its whole-image logit a part's zoomed [`Detail::Refine`] logit may go. Logits
+/// are about ±10 deep inside or outside a mask and near 0 across its blurred edge, so a refine can
+/// move an edge the whole image left unsure, but a pixel at -10 stays outside (-4).
+const REFINE_REACH: f32 = 6.0;
+
 /// How zoomed detail logits combine with a part's whole-image logits inside their area.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
     /// Use the detail logits alone (the small item the zoomed area was made for).
     Replace,
-    /// Use the higher of the detail and whole-image logits (other parts in the area).
+    /// Use the higher of the detail and whole-image logits (other parts in the area), the detail
+    /// at most [`REFINE_REACH`] above the whole-image logit.
     Refine,
 }
 
@@ -353,7 +359,13 @@ impl PartMap {
                     Detail::Refine => refine = Some(refine.map_or(d, |v| v.max(d))),
                 }
             }
-            vals.push((base.at(x, y), item, refine));
+            let whole = base.at(x, y);
+            // A zoomed prompt that holds only one or two of a part's points can return a mask of
+            // the whole garment around them (hair's one point over a teal kurta and dupatta): it
+            // may sharpen the part's edge where the whole image was unsure, not claim pixels the
+            // whole image put firmly outside the part.
+            let refine = refine.map(|r| r.min(whole + REFINE_REACH));
+            vals.push((whole, item, refine));
         }
         let claimed = vals.iter().any(|(_, item, _)| item.is_some_and(|v| v > 0.0));
         let mut best: Option<(usize, f32)> = None;
@@ -1002,6 +1014,18 @@ mod tests {
         let mut map = PartMap::new(vec![logits(10, 1, |_, _| 5.0)]).unwrap();
         map.add_detail(0, partial, Detail::Replace).unwrap();
         assert_eq!(map.at(5.0, 0.0), None);
+    }
+
+    #[test]
+    fn a_refine_sharpens_an_unsure_edge_but_does_not_claim_firm_outside() {
+        // Part 0 (hair) is firmly outside at x 0..5 and unsure at x 5..10 at whole-image scale;
+        // part 1 (kurta) is moderately inside everywhere. A zoomed prompt with one hair point
+        // says "hair" over the whole area.
+        let hair = logits(10, 1, |x, _| if x < 5 { -10.0 } else { -1.0 });
+        let mut map = PartMap::new(vec![hair, logits(10, 1, |_, _| 3.0)]).unwrap();
+        map.add_detail(0, logits(10, 1, |_, _| 10.0), Detail::Refine).unwrap();
+        assert_eq!(map.at(2.0, 0.0).map(|p| p.0), Some(1), "firm outside stays the kurta's");
+        assert_eq!(map.at(7.0, 0.0).map(|p| p.0), Some(0), "the unsure edge is sharpened to hair");
     }
 
     #[test]
