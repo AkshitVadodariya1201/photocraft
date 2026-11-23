@@ -649,7 +649,7 @@ mod tests {
 
     #[test]
     fn missing_model_is_an_error() {
-        let mut s = Session::new();
+        let mut s = crate::session();
         s.execute("file.new", json!({"width": 64, "height": 48})).unwrap();
         let r = s.execute(CMD, json!({"parts": [{"name": "A", "points": [[10, 10]]}], "modelDir": "Z:/no/such/folder"}));
         assert!(r.is_err());
@@ -673,7 +673,7 @@ mod tests {
         if std::env::var_os("PHOTOCRAFT_SAM_DIR").is_none() {
             return;
         }
-        let mut s = Session::new();
+        let mut s = crate::session();
         s.execute("file.new", json!({"width": 256, "height": 256})).unwrap();
         s.edit("paint", |doc, _| {
             let bg = doc.layers[0].surface_mut().unwrap();
@@ -718,7 +718,7 @@ mod tests {
         if std::env::var_os("PHOTOCRAFT_SAM_DIR").is_none() {
             return;
         }
-        let mut s = Session::new();
+        let mut s = crate::session();
         s.execute("file.new", json!({"width": 256, "height": 256})).unwrap();
         s.edit("paint", |doc, _| {
             let bg = doc.layers[0].surface_mut().unwrap();
