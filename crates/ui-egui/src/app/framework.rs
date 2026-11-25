@@ -30,7 +30,12 @@ use craft::ui::runtime::install::WheelModifiers;
 use craft::ui::runtime::{InstallError, InstallSpec};
 use craft::ui::shell::embed;
 use craft::window::policy::Decision;
-use craft::window::system::SystemWindows;
+// Tests run headless: the desktop pointer Windows tells is the mouse of the machine running them, not the test's
+// pointer, so tests see no desktop services on any platform, as on Linux.
+#[cfg(test)]
+use craft::window::system::NoWindows as Desktop;
+#[cfg(not(test))]
+use craft::window::system::SystemWindows as Desktop;
 use photocraft_engine::Session;
 use photocraft_engine::prefs::{AppearanceMode, Preferences};
 use serde_json::Value;
@@ -48,9 +53,9 @@ pub(crate) fn install(ctx: &egui::Context, fonts: &UiFonts<'_>, frame: Option<De
     // PhotoCraft's input always has.
     let wheel = WheelModifiers::new(egui::Modifiers::NONE, egui::Modifiers::SHIFT | egui::Modifiers::COMMAND);
     let wake = ctx.clone();
-    let mut spec = InstallSpec::new(ShellInfo::default().backend(Backend::from_env()), Arc::new(SystemWindows))
+    let mut spec = InstallSpec::new(ShellInfo::default().backend(Backend::from_env()), Arc::new(Desktop))
         .wheel(wheel)
-        .app_id(crate::os_window::APP_ID)
+        .app_id(crate::os_window::app_id())
         .system(SystemReader::start(move || wake.request_repaint()));
     if let Some(decision) = frame {
         spec = spec.frame(decision);
@@ -372,6 +377,10 @@ impl Framework {
     /// in-memory suite the app starts with.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn open_suite(&mut self, ctx: &egui::Context) {
+        // A nightly keeps its in-memory suite; never open the stable shared theme store.
+        if !crate::os_window::stable_services_allowed() {
+            return;
+        }
         use craft::theme_store::{StoreOptions, SuiteDir, SuiteWatch};
         let ctx = ctx.clone();
         let options = StoreOptions::new(concat!("photocraft ", env!("CARGO_PKG_VERSION")));
